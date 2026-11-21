@@ -1,0 +1,28 @@
+{
+  "$schema": "https://antigravity.google/schemas/v1/plugin.json",
+  "name": "plugin-installer",
+  "displayName": "Plugin Installer",
+  "version": "1.0.0",
+  "description": "Visual plugin installer and manager for installing custom plugins from GitHub repositories, npm packages, or local directories.",
+  "logo": "assets/logo.svg",
+  "suggestedPrompts": [
+    "Open the Plugin Installer panel to add a plugin from GitHub, npm, or a local folder",
+    "Install a plugin from a GitHub repository URL and verify its manifest",
+    "List my installed plugins and check their component counts"
+  ],
+  "author": {
+    "name": "yedanten",
+    "url": "https://github.com/yedanten"
+  },
+  "homepage": "https://github.com/yedanten/antigravity-plugin-installer",
+  "repository": "https://github.com/yedanten/antigravity-plugin-installer",
+  "license": "MIT",
+  "keywords": [
+    "installer",
+    "github",
+    "npm",
+    "local",
+    "extensions",
+    "customizations"
+  ]
+}

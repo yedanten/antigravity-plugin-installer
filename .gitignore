@@ -1,0 +1,35 @@
+# Dependencies
+node_modules/
+npm-debug.log*
+pnpm-debug.log*
+yarn-debug.log*
+
+# Intermediate build & test artifacts
+dist/
+ui/dist/
+coverage/
+.vite/
+*.tsbuildinfo
+
+# Local runtime data & caches
+.cache/
+.tmp/
+tmp/
+*.log
+
+# Environment & secrets
+.env
+.env.*
+!.env.example
+
+# OS & editor files
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Local reference assets
+dsh添加插件界面示例.png
