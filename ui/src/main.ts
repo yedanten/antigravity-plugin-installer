@@ -94,7 +94,7 @@ const state: AppState = {
   },
 };
 
-const app = new App({ name: 'Plugin Installer', version: '1.0.0' }, {});
+const app = new App({ name: 'Plugin Installer', version: '1.1.0' }, {});
 let toastTimer: number | null = null;
 
 function esc(value: string): string {
@@ -292,9 +292,21 @@ async function submitInstall(forceOverwrite = false) {
         applyInventory(sc.inventory);
       }
       const msg = getMessages(state.locale);
-      showToast('success', `${msg.toastInstalled}: ${sc.install.plugin.displayName}`);
+      const overwroteExisting = sc.install.overwrote ?? Boolean(args.overwrite);
+      const toastLabel = sc.install.restoredEnabled
+        ? msg.toastUpdatedRestored
+        : overwroteExisting && sc.install.wasEnabled === false && sc.install.enabled === false
+          ? msg.toastUpdatedKeptDisabled
+          : overwroteExisting
+            ? msg.toastUpdated
+            : msg.toastInstalled;
+      showToast('success', `${toastLabel}: ${sc.install.plugin.displayName}`);
     } else {
-      m.error = sc?.error || 'Installation failed.';
+      const msg = getMessages(state.locale);
+      m.error =
+        sc?.code === 'SELF_UPDATE_BLOCKED'
+          ? msg.errSelfUpdate
+          : sc?.error || 'Installation failed.';
       m.errorCode = sc?.code || 'INSTALL_FAILED';
     }
   } catch (err) {
@@ -322,13 +334,19 @@ async function handleUninstall(plugin: PluginItem) {
       },
     });
     const sc = res.structuredContent as
-      | { ok: boolean; inventory?: InventoryPayload; error?: string }
+      | { ok: boolean; inventory?: InventoryPayload; error?: string; code?: string }
       | undefined;
+    const t = getMessages(state.locale);
     if (sc?.ok) {
       if (sc.inventory) applyInventory(sc.inventory);
-      showToast('success', `${getMessages(state.locale).toastUninstalled}: ${plugin.displayName}`);
+      showToast('success', `${t.toastUninstalled}: ${plugin.displayName}`);
     } else {
-      showToast('error', sc?.error || 'Failed to uninstall plugin.');
+      showToast(
+        'error',
+        sc?.code === 'SELF_UNINSTALL_BLOCKED'
+          ? t.errSelfUninstall
+          : sc?.error || 'Failed to uninstall plugin.',
+      );
     }
   } catch (err) {
     showToast('error', err instanceof Error ? err.message : String(err));
@@ -353,13 +371,83 @@ async function handleReinstall(plugin: PluginItem) {
       },
     });
     const sc = res.structuredContent as
-      | { ok: boolean; inventory?: InventoryPayload; error?: string }
+      | {
+          ok: boolean;
+          install?: InstallResultPayload;
+          inventory?: InventoryPayload;
+          error?: string;
+          code?: string;
+        }
       | undefined;
+    const t = getMessages(state.locale);
     if (sc?.ok) {
       if (sc.inventory) applyInventory(sc.inventory);
-      showToast('success', `${getMessages(state.locale).toastUpdated}: ${plugin.displayName}`);
+      const toastLabel = sc.install?.restoredEnabled
+        ? t.toastUpdatedRestored
+        : sc.install?.wasEnabled === false && sc.install?.enabled === false
+          ? t.toastUpdatedKeptDisabled
+          : t.toastUpdated;
+      showToast('success', `${toastLabel}: ${plugin.displayName}`);
     } else {
-      showToast('error', sc?.error || 'Failed to update plugin.');
+      showToast(
+        'error',
+        sc?.code === 'SELF_UPDATE_BLOCKED'
+          ? t.errSelfUpdate
+          : sc?.error || 'Failed to update plugin.',
+      );
+    }
+  } catch (err) {
+    showToast('error', err instanceof Error ? err.message : String(err));
+  } finally {
+    state.busyPluginId = null;
+    render();
+  }
+}
+
+async function handleToggleEnabled(plugin: PluginItem) {
+  if (state.busyPluginId) return;
+  state.busyPluginId = plugin.id;
+  render();
+
+  const nextEnabled = !plugin.enabled;
+  try {
+    const res = await app.callServerTool({
+      name: 'app_set_plugin_enabled',
+      arguments: {
+        dir: plugin.dir,
+        scope: plugin.scope,
+        workspacePath: state.workspacePath,
+        enabled: nextEnabled,
+      },
+    });
+    const sc = res.structuredContent as
+      | {
+          ok: boolean;
+          enabled?: boolean;
+          inventory?: InventoryPayload;
+          error?: string;
+          code?: string;
+        }
+      | undefined;
+    const t = getMessages(state.locale);
+    if (sc?.ok) {
+      if (sc.inventory) {
+        applyInventory(sc.inventory);
+      } else {
+        await refreshInventory();
+      }
+      const effectiveEnabled = typeof sc.enabled === 'boolean' ? sc.enabled : nextEnabled;
+      showToast(
+        'success',
+        `${effectiveEnabled ? t.toastEnabled : t.toastDisabled}: ${plugin.displayName}`,
+      );
+    } else {
+      showToast(
+        'error',
+        sc?.code === 'SELF_DISABLE_BLOCKED'
+          ? t.errSelfDisable
+          : sc?.error || 'Failed to update plugin state.',
+      );
     }
   } catch (err) {
     showToast('error', err instanceof Error ? err.message : String(err));
@@ -436,11 +524,13 @@ function renderPluginCard(p: PluginItem): string {
   if (p.components.agents.length) chips.push(`${p.components.agents.length} ${t.agents}`);
   if (p.components.rules.length) chips.push(`${p.components.rules.length} ${t.rules}`);
   if (p.components.hasHooks) chips.push(t.hooks);
+  if (p.components.sidecars?.length) chips.push(`${p.components.sidecars.length} ${t.sidecars}`);
 
   const sourceHint = p.installMeta?.displaySource || (p.isSymlink && p.linkTarget ? p.linkTarget : p.dir);
+  const toggleActionLabel = p.enabled ? t.disablePlugin : t.enablePlugin;
 
   return `
-    <article class="plugin-card" data-plugin-id="${esc(p.id)}">
+    <article class="plugin-card ${p.enabled ? '' : 'is-disabled'}" data-plugin-id="${esc(p.id)}">
       <div class="card-top">
         <div class="plugin-icon">
           ${p.logoDataUri ? `<img src="${esc(p.logoDataUri)}" alt="" />` : esc(initials)}
@@ -453,6 +543,22 @@ function renderPluginCard(p: PluginItem): string {
             ${statusBadge}
           </div>
           ${p.description ? `<p class="card-desc">${esc(p.description)}</p>` : ''}
+        </div>
+        <div class="card-toggle-wrap">
+          <button
+            type="button"
+            class="toggle-switch ${p.enabled ? 'is-enabled' : ''}"
+            role="switch"
+            aria-checked="${p.enabled ? 'true' : 'false'}"
+            aria-label="${esc(toggleActionLabel)}"
+            title="${esc(toggleActionLabel)}"
+            data-action="toggle-enabled"
+            data-id="${esc(p.id)}"
+            ${busy ? 'disabled' : ''}
+          >
+            <span class="toggle-track" aria-hidden="true"><span class="toggle-thumb"></span></span>
+            <span class="toggle-label">${esc(p.enabled ? t.enabled : t.disabled)}</span>
+          </button>
         </div>
       </div>
 
@@ -1167,6 +1273,11 @@ function bindEvents() {
       case 'reinstall': {
         const plugin = state.plugins.find((p) => p.id === actionEl.dataset.id);
         if (plugin) void handleReinstall(plugin);
+        break;
+      }
+      case 'toggle-enabled': {
+        const plugin = state.plugins.find((p) => p.id === actionEl.dataset.id);
+        if (plugin) void handleToggleEnabled(plugin);
         break;
       }
       case 'set-source-type':

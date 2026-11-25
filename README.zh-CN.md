@@ -25,8 +25,8 @@
   - 本地安装支持 **复制安装**（推荐，独立拷贝文件）或 **开发软链接**（macOS/Linux 实时联调）。
   - 内置可折叠格式引导与“填入示例”按钮、分支/子目录选项、全局/工作区安装范围切换，以及同名插件冲突一键覆盖重试。
 - **已安装插件管理**：
-  - 统一展示全局、工作区与内置插件，呈现图标、版本、来源标签、组件统计徽章（`Skills`、`MCP`、`Agents`、`Rules`、`Hooks`）与清单校验提示。
-  - 支持基于来源记录的一键 **更新 / 重装** 与带二次确认的安全 **卸载**（严格保护内置插件，绝不手改 `config.json`）。
+  - 统一展示全局、工作区与内置插件，呈现图标、版本、来源标签、组件统计徽章（`Skills`、`MCP`、`Agents`、`Rules`、`Hooks`、`Sidecars`）与清单校验提示。
+  - 支持在插件卡片上直接切换 **启用 / 禁用** 状态（原子化读写 `config.json`），支持基于来源记录的一键 **更新 / 重装**（更新前自动禁用已启用插件以避免资源锁定，更新成功后自动恢复原启用状态）以及带二次确认的安全 **卸载**（严格保护内置插件）。
 - **零运行时依赖**：
   - MCP Server 完全基于 Node.js（`>= 18.18.0`）原生模块实现，克隆或安装后无需执行 `npm install` 即可开箱即用。
 
@@ -71,7 +71,7 @@ npm run install:local
 1. **打开界面**：点击 Antigravity 左侧栏中的 **Plugin Installer**（或从右侧辅助面板 `+` 菜单打开）。
 2. **安装插件**：点击页面右上角 **`+ Install Plugin`** 按钮，粘贴 GitHub 地址、npm 包名或本地插件目录路径，按需调整分支、子目录、镜像源或安装范围后点击 **安装插件**。
 3. **对话唤起**：在聊天中输入 `/install-plugin`，或直接让 Agent 打开插件安装器 / 安装指定插件地址。
-4. **启用与禁用**：新安装的插件默认自动启用并热加载；如需启用或禁用插件，请前往 Antigravity 原生 **Customizations（自定义）** 页面操作。
+4. **启用与禁用**：新安装的插件默认自动启用并热加载；您可以直接在 **Plugin Installer** 插件卡片的开关上切换启用/禁用状态，也可在 Antigravity 原生 **Customizations（自定义）** 页面操作。
 
 ## 可选环境变量
 
@@ -81,6 +81,8 @@ npm run install:local
 | :--- | :--- |
 | `ANTIGRAVITY_PLUGINS_DIR` | 自定义全局插件目录路径（默认 `~/.gemini/config/plugins`）。 |
 | `ANTIGRAVITY_BUILTIN_PLUGINS_DIR` | 自定义只读扫描的内置插件目录路径。 |
+| `ANTIGRAVITY_APP_DATA_DIR` | 自定义 Antigravity 应用数据目录（用于回退解析 `builtin/plugins`）。 |
+| `ANTIGRAVITY_CONFIG_PATH` | 自定义存储插件启停状态的 `config.json` 路径。 |
 | `PLUGIN_INSTALLER_APP_HTML` | 指向自定义 HTML 路径，便于开发 UI 时热重载调试。 |
 
 ## 本地开发与构建

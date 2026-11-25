@@ -10,6 +10,7 @@ export interface PluginComponents {
   agents: string[];
   rules: string[];
   hasHooks: boolean;
+  sidecars?: string[];
 }
 
 export interface InstallMeta {
@@ -85,6 +86,11 @@ export interface InstallStep {
 
 export interface InstallResultPayload {
   ok: boolean;
+  overwrote?: boolean;
+  wasEnabled?: boolean;
+  autoDisabled?: boolean;
+  restoredEnabled?: boolean;
+  enabled?: boolean;
   plugin: {
     dir: string;
     name: string;

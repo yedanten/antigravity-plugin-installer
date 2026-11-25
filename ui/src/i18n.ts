@@ -19,6 +19,8 @@ export interface Messages {
   emptySearchDesc: string;
   enabled: string;
   disabled: string;
+  enablePlugin: string;
+  disablePlugin: string;
   builtin: string;
   linked: string;
   globalScope: string;
@@ -39,6 +41,7 @@ export interface Messages {
   agents: string;
   rules: string;
   hooks: string;
+  sidecars: string;
   modalTitle: string;
   modalSubtitle: string;
   sourceAuto: string;
@@ -94,7 +97,14 @@ export interface Messages {
   installAnother: string;
   toastUninstalled: string;
   toastUpdated: string;
+  toastUpdatedRestored: string;
+  toastUpdatedKeptDisabled: string;
   toastInstalled: string;
+  toastEnabled: string;
+  toastDisabled: string;
+  errSelfDisable: string;
+  errSelfUpdate: string;
+  errSelfUninstall: string;
   loading: string;
 }
 
@@ -117,6 +127,8 @@ const zh: Messages = {
   emptySearchDesc: '尝试更换关键词或切换上方筛选分类。',
   enabled: '已启用',
   disabled: '已禁用',
+  enablePlugin: '启用插件',
+  disablePlugin: '禁用插件',
   builtin: '内置',
   linked: '软链接',
   globalScope: '全局',
@@ -137,6 +149,7 @@ const zh: Messages = {
   agents: 'Agents',
   rules: 'Rules',
   hooks: 'Hooks',
+  sidecars: 'Sidecars',
   modalTitle: 'Install Plugin',
   modalSubtitle: '输入插件的 GitHub 仓库地址、npm 包名或本地目录路径。',
   sourceAuto: '自动识别',
@@ -186,17 +199,24 @@ const zh: Messages = {
   overwriteLabel: '如存在同名插件，覆盖重新安装',
   securityNoticeTitle: '请确认插件来源可信',
   securityNoticeBody:
-    '插件中的 MCP Server 与 Hooks 会以当前用户权限运行。安装完成后 Antigravity 会自动热发现新插件；如需启用或禁用，请前往原生 Customizations 页面操作。',
+    '插件中的 MCP Server 与 Hooks 会以当前用户权限运行。安装完成后 Antigravity 会自动热发现新插件；也可在插件列表中直接切换启用或禁用状态。',
   installSubmit: '安装插件',
   installing: '正在安装...',
   overwriteAndRetry: '勾选覆盖并重新安装',
   installSuccessTitle: '插件安装成功',
-  installSuccessHint: 'Antigravity 会自动发现新安装的插件（无需重启）。可在原生 Customizations 页面查看或启停。',
+  installSuccessHint: 'Antigravity 会自动发现新安装的插件（无需重启）。可在插件列表中直接切换启用/禁用，或前往原生 Customizations 页面管理。',
   done: '完成',
   installAnother: '继续安装其他插件',
   toastUninstalled: '已卸载插件',
   toastUpdated: '已重新安装插件',
+  toastUpdatedRestored: '已更新并恢复启用',
+  toastUpdatedKeptDisabled: '已更新（保持禁用）',
   toastInstalled: '已成功安装插件',
+  toastEnabled: '已启用插件',
+  toastDisabled: '已禁用插件',
+  errSelfDisable: '无法在当前面板中禁用 Plugin Installer 自身，否则会中断其 MCP 服务与管理界面。',
+  errSelfUpdate: '无法在当前面板中更新 Plugin Installer 自身，请使用 npm run install:local 或 Antigravity CLI 更新。',
+  errSelfUninstall: '无法在当前面板中卸载 Plugin Installer 自身，否则会删除其正在运行的 MCP 服务与管理界面。',
   loading: '正在加载已安装插件...',
 };
 
@@ -219,6 +239,8 @@ const en: Messages = {
   emptySearchDesc: 'Try a different search query or filter category.',
   enabled: 'Enabled',
   disabled: 'Disabled',
+  enablePlugin: 'Enable plugin',
+  disablePlugin: 'Disable plugin',
   builtin: 'Built-in',
   linked: 'Linked',
   globalScope: 'Global',
@@ -239,6 +261,7 @@ const en: Messages = {
   agents: 'Agents',
   rules: 'Rules',
   hooks: 'Hooks',
+  sidecars: 'Sidecars',
   modalTitle: 'Install Plugin',
   modalSubtitle: 'Enter a GitHub repository URL, npm package name, or local directory path.',
   sourceAuto: 'Auto',
@@ -288,17 +311,24 @@ const en: Messages = {
   overwriteLabel: 'Overwrite if a plugin with the same directory already exists',
   securityNoticeTitle: 'Verify plugin trust before installing',
   securityNoticeBody:
-    'Bundled MCP servers and hooks run with your user permissions. Newly installed plugins are discovered automatically without restarting; enable or disable them in Customizations.',
+    'Bundled MCP servers and hooks run with your user permissions. Newly installed plugins are discovered automatically without restarting, and can be enabled or disabled directly from their plugin card.',
   installSubmit: 'Install Plugin',
   installing: 'Installing...',
   overwriteAndRetry: 'Overwrite & Retry',
   installSuccessTitle: 'Plugin installed',
-  installSuccessHint: 'Antigravity discovers new plugins automatically. Manage enable/disable state from Customizations.',
+  installSuccessHint: 'Antigravity discovers new plugins automatically. Toggle enable/disable state directly from the plugin list or in Customizations.',
   done: 'Done',
   installAnother: 'Install another',
   toastUninstalled: 'Uninstalled',
   toastUpdated: 'Updated',
+  toastUpdatedRestored: 'Updated and re-enabled',
+  toastUpdatedKeptDisabled: 'Updated (kept disabled)',
   toastInstalled: 'Installed',
+  toastEnabled: 'Enabled',
+  toastDisabled: 'Disabled',
+  errSelfDisable: 'Cannot disable Plugin Installer from its own panel, as doing so would terminate its active MCP server and UI.',
+  errSelfUpdate: 'Cannot update Plugin Installer from inside its own running MCP server. Use "npm run install:local" or Antigravity CLI.',
+  errSelfUninstall: 'Cannot uninstall Plugin Installer from its own panel, as doing so would delete its running MCP server and UI.',
   loading: 'Loading installed plugins...',
 };
 

@@ -9,13 +9,21 @@ import {
   expandHomePath,
   getGlobalPluginsDir,
   getWorkspacePluginsDir,
+  isSamePath,
+  readEnabledOverrides,
   registryKey,
+  setPluginEnabled as defaultSetPluginEnabled,
 } from './plugins.mjs';
 import {
   findManifestPath,
+  parseJsonc,
   sanitizePluginDirName,
   validatePluginDir,
 } from './validator.mjs';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const PLUGIN_ROOT = path.resolve(__dirname, '..');
+const RETRYABLE_RM_CODES = new Set(['EBUSY', 'EPERM', 'EACCES', 'ENOTEMPTY']);
 
 const execFileAsync = promisify(execFile);
 
@@ -425,7 +433,7 @@ async function resolvePluginRootInExtracted(baseDir, explicitSubpath = '') {
   }
 
   throw new Error(
-    'No plugin.json (or .antigravity-plugin/plugin.json) found in the repository root or subdirectories.',
+    'No plugin.json (or .antigravity-plugin/plugin.json, .gemini-plugin/plugin.json) found in the repository root or subdirectories.',
   );
 }
 
@@ -673,6 +681,126 @@ export async function previewPluginSource({ source, sourceType = 'auto', ref = '
   };
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function pathExists(p) {
+  try {
+    await fs.lstat(p);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function resolveExistingEnabledState(dirName, destPath) {
+  const overrides = await readEnabledOverrides();
+  const override = Object.hasOwn(overrides, dirName) ? overrides[dirName] : undefined;
+  if (override && typeof override.enabled === 'boolean') {
+    return { enabled: override.enabled, hasOverride: true };
+  }
+  try {
+    const manifestPath = await findManifestPath(destPath);
+    if (manifestPath) {
+      const raw = await fs.readFile(manifestPath, 'utf8');
+      const manifest = parseJsonc(raw);
+      return { enabled: manifest?.disabled !== true, hasOverride: false };
+    }
+  } catch {
+    // Fall back to enabled default if existing manifest is unreadable
+  }
+  return { enabled: true, hasOverride: false };
+}
+
+async function removePathSafe(targetPath) {
+  let st;
+  try {
+    st = await fs.lstat(targetPath);
+  } catch (err) {
+    if (err && err.code === 'ENOENT') return;
+    throw err;
+  }
+  if (st.isSymbolicLink()) {
+    await fs.unlink(targetPath);
+  } else {
+    await fs.rm(targetPath, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+  }
+}
+
+async function removeBackupWithRetry(backupPath, steps) {
+  const maxAttempts = 4;
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      await fs.rm(backupPath, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+      return;
+    } catch (err) {
+      const code = err && typeof err === 'object' ? err.code : '';
+      if (RETRYABLE_RM_CODES.has(code) && attempt < maxAttempts) {
+        await sleep(150);
+        continue;
+      }
+      steps.push({
+        phase: 'cleanup',
+        status: 'warn',
+        message: `Installed successfully, but could not remove temporary backup "${path.basename(backupPath)}": ${err instanceof Error ? err.message : String(err)}`,
+      });
+      return;
+    }
+  }
+}
+
+async function prepareExistingForReplaceWithRetry(
+  destPath,
+  isSymlink,
+  {
+    retries = 12,
+    delayMs = 450,
+    removeTarget = null,
+    moveExistingToBackup = null,
+    backupPath = '',
+  } = {},
+) {
+  const maxAttempts = Math.max(1, Number(retries) + 1);
+  const waitMs = Math.max(0, Number(delayMs) || 0);
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      if (typeof removeTarget === 'function') {
+        await removeTarget(destPath, { isSymlink, attempt, backupPath });
+        return { backupPath: null };
+      }
+      if (isSymlink) {
+        await fs.unlink(destPath);
+        return { backupPath: null };
+      }
+      if (typeof moveExistingToBackup === 'function') {
+        await moveExistingToBackup(destPath, backupPath, { attempt });
+      } else {
+        await fs.rename(destPath, backupPath);
+      }
+      return { backupPath };
+    } catch (err) {
+      const code = err && typeof err === 'object' ? err.code : '';
+      const canRetry = RETRYABLE_RM_CODES.has(code) && attempt < maxAttempts;
+      if (!canRetry) {
+        if (RETRYABLE_RM_CODES.has(code)) {
+          const lockErr = new Error(
+            `Failed to replace existing plugin directory "${path.basename(destPath)}" because files are locked (${code}): ${err instanceof Error ? err.message : String(err)}`,
+          );
+          lockErr.code = code;
+          throw lockErr;
+        }
+        throw err;
+      }
+      if (waitMs > 0) {
+        await sleep(waitMs);
+      }
+    }
+  }
+  return { backupPath: null };
+}
+
 export async function installPlugin({
   source,
   sourceType = 'auto',
@@ -685,6 +813,14 @@ export async function installPlugin({
   targetDirName = '',
   overwrite = false,
   installRegistry = null,
+  isPluginEnabled = null,
+  setPluginEnabled = null,
+  disableSettleMs = 400,
+  removeRetries = 12,
+  removeRetryDelayMs = 450,
+  removeTarget = null,
+  moveExistingToBackup = null,
+  pluginRoot = PLUGIN_ROOT,
 }) {
   const steps = [];
   const parsed = await parsePluginSource(source, { sourceType, ref, subpath });
@@ -735,7 +871,7 @@ export async function installPlugin({
       });
     }
 
-    // Validate plugin structure & plugin.json
+    // Validate plugin structure & plugin.json BEFORE modifying live state
     const validation = await validatePluginDir(sourcePluginRoot, { strict: false });
     if (!validation.valid) {
       throw new Error(`Plugin validation failed:\n- ${validation.errors.join('\n- ')}`);
@@ -768,7 +904,11 @@ export async function installPlugin({
     }
 
     // Prevent self-copying onto the exact same directory
-    if (path.resolve(sourcePluginRoot) === destPath) {
+    const sameLogicalDest =
+      process.platform === 'win32'
+        ? path.resolve(sourcePluginRoot).toLowerCase() === destPath.toLowerCase()
+        : path.resolve(sourcePluginRoot) === destPath;
+    if (sameLogicalDest) {
       throw new Error('Source directory is already the target installation directory.');
     }
 
@@ -781,6 +921,21 @@ export async function installPlugin({
       existingStat = null;
     }
 
+    let wasEnabled = false;
+    let autoDisabled = false;
+    let restoredEnabled = false;
+    let finalEnabled = validation.manifest?.disabled !== true;
+    let hasExplicitOverride = false;
+    let removedExisting = false;
+    let backupPath = '';
+    let movedToBackup = false;
+    const previousLinkTarget = existingStat?.isSymbolicLink()
+      ? await fs.readlink(destPath).catch(() => null)
+      : null;
+
+    const toggleFn =
+      typeof setPluginEnabled === 'function' ? setPluginEnabled : defaultSetPluginEnabled;
+
     if (existingStat) {
       if (!overwrite) {
         const err = new Error(
@@ -790,75 +945,215 @@ export async function installPlugin({
         err.existingDir = dirName;
         throw err;
       }
-      if (existingStat.isSymbolicLink()) {
-        await fs.unlink(destPath);
-      } else {
-        await fs.rm(destPath, { recursive: true, force: true });
+
+      if (await isSamePath(destPath, pluginRoot)) {
+        const selfErr = new Error(
+          'Cannot update Plugin Installer from inside its own running MCP server. Use "npm run install:local" or update via Antigravity CLI.',
+        );
+        selfErr.code = 'SELF_UPDATE_BLOCKED';
+        throw selfErr;
       }
-      steps.push({
-        phase: 'replace',
-        status: 'ok',
-        message: `Removed previous installation at "${dirName}".`,
-      });
+
+      if (typeof isPluginEnabled === 'function') {
+        wasEnabled = Boolean(await isPluginEnabled(dirName, destPath));
+      } else {
+        const existingState = await resolveExistingEnabledState(dirName, destPath);
+        wasEnabled = existingState.enabled;
+        hasExplicitOverride = existingState.hasOverride;
+      }
+
+      if (wasEnabled) {
+        await toggleFn(dirName, false);
+        autoDisabled = true;
+        steps.push({
+          phase: 'disable',
+          status: 'ok',
+          message: `Temporarily disabled "${dirName}" before updating.`,
+        });
+        if (disableSettleMs > 0) {
+          await sleep(disableSettleMs);
+        }
+      }
     }
 
     const effectiveMode = parsed.type === 'local' && mode === 'link' ? 'link' : 'copy';
-    if (effectiveMode === 'link') {
-      const linkType = process.platform === 'win32' ? 'junction' : 'dir';
-      await fs.symlink(sourcePluginRoot, destPath, linkType);
-      steps.push({
-        phase: 'install',
-        status: 'ok',
-        message: `Linked local plugin (${linkType}) -> ${destPath}`,
-      });
-    } else {
-      await copyDirFiltered(sourcePluginRoot, destPath);
-      steps.push({
-        phase: 'install',
-        status: 'ok',
-        message: `Installed plugin files to ${destPath}`,
-      });
-    }
 
-    const meta = {
-      dir: dirName,
-      name: validation.manifest?.name || dirName,
-      displayName: validation.manifest?.displayName || validation.manifest?.name || dirName,
-      version: validation.manifest?.version || resolvedVersion || '',
-      sourceType: parsed.type,
-      rawSource: stripQuotes(source),
-      displaySource: parsed.displaySource,
-      registry: usedRegistry || (parsed.type === 'npm' ? normalizeRegistryUrl(registry) : ''),
-      ref: parsed.ref || ref || '',
-      subpath: parsed.subpath || subpath || '',
-      mode: effectiveMode,
-      scope,
-      workspacePath: scope === 'workspace' ? path.resolve(workspacePath) : '',
-      installedAt: new Date().toISOString(),
-    };
+    try {
+      if (existingStat) {
+        const candidateBackupPath = path.join(
+          resolvedTargetRoot,
+          `.${dirName}.backup-${Date.now()}-${process.pid}-${Math.random().toString(16).slice(2, 8)}`,
+        );
+        const prep = await prepareExistingForReplaceWithRetry(
+          destPath,
+          existingStat.isSymbolicLink(),
+          {
+            retries: removeRetries,
+            delayMs: removeRetryDelayMs,
+            removeTarget,
+            moveExistingToBackup,
+            backupPath: candidateBackupPath,
+          },
+        );
+        removedExisting = true;
+        if (prep.backupPath) {
+          backupPath = prep.backupPath;
+          movedToBackup = true;
+        }
+        steps.push({
+          phase: 'replace',
+          status: 'ok',
+          message: movedToBackup
+            ? `Backed up previous installation of "${dirName}" before replacement.`
+            : `Removed previous installation at "${dirName}".`,
+        });
+      }
 
-    if (installRegistry) {
-      await installRegistry.record(registryKey(scope, dirName, workspacePath), meta);
-    }
+      if (effectiveMode === 'link') {
+        const linkType = process.platform === 'win32' ? 'junction' : 'dir';
+        await fs.symlink(sourcePluginRoot, destPath, linkType);
+        steps.push({
+          phase: 'install',
+          status: 'ok',
+          message: `Linked local plugin (${linkType}) -> ${destPath}`,
+        });
+      } else {
+        await copyDirFiltered(sourcePluginRoot, destPath);
+        steps.push({
+          phase: 'install',
+          status: 'ok',
+          message: `Installed plugin files to ${destPath}`,
+        });
+      }
 
-    return {
-      ok: true,
-      plugin: {
+      const meta = {
         dir: dirName,
-        name: meta.name,
-        displayName: meta.displayName,
-        version: meta.version,
-        description: validation.manifest?.description || '',
-        path: destPath,
-        scope,
-        mode: effectiveMode,
+        name: validation.manifest?.name || dirName,
+        displayName: validation.manifest?.displayName || validation.manifest?.name || dirName,
+        version: validation.manifest?.version || resolvedVersion || '',
         sourceType: parsed.type,
+        rawSource: stripQuotes(source),
         displaySource: parsed.displaySource,
-        components: validation.components,
-        warnings: validation.warnings,
-      },
-      steps,
-    };
+        registry: usedRegistry || (parsed.type === 'npm' ? normalizeRegistryUrl(registry) : ''),
+        ref: parsed.ref || ref || '',
+        subpath: parsed.subpath || subpath || '',
+        mode: effectiveMode,
+        scope,
+        workspacePath: scope === 'workspace' ? path.resolve(workspacePath) : '',
+        installedAt: new Date().toISOString(),
+      };
+
+      if (installRegistry) {
+        await installRegistry.record(registryKey(scope, dirName, workspacePath), meta);
+      }
+
+      if (existingStat) {
+        if (wasEnabled) {
+          await toggleFn(dirName, true);
+          restoredEnabled = true;
+          finalEnabled = true;
+          steps.push({
+            phase: 'enable',
+            status: 'ok',
+            message: `Restored enabled state for "${dirName}".`,
+          });
+        } else {
+          if (!hasExplicitOverride && validation.manifest?.disabled !== true) {
+            await toggleFn(dirName, false);
+          }
+          restoredEnabled = false;
+          finalEnabled = false;
+        }
+      } else {
+        const currentState = await resolveExistingEnabledState(dirName, destPath);
+        finalEnabled = currentState.enabled;
+      }
+
+      if (backupPath && (await pathExists(backupPath))) {
+        await removeBackupWithRetry(backupPath, steps);
+      }
+
+      return {
+        ok: true,
+        overwrote: Boolean(existingStat),
+        wasEnabled,
+        autoDisabled,
+        restoredEnabled,
+        enabled: finalEnabled,
+        plugin: {
+          dir: dirName,
+          name: meta.name,
+          displayName: meta.displayName,
+          version: meta.version,
+          description: validation.manifest?.description || '',
+          path: destPath,
+          scope,
+          mode: effectiveMode,
+          sourceType: parsed.type,
+          displaySource: parsed.displaySource,
+          components: validation.components,
+          warnings: validation.warnings,
+        },
+        steps,
+      };
+    } catch (err) {
+      let cleanupOk = true;
+      let restoreOk = true;
+
+      if (movedToBackup && backupPath && (await pathExists(backupPath))) {
+        if (await pathExists(destPath)) {
+          try {
+            await removePathSafe(destPath);
+          } catch {
+            cleanupOk = false;
+            restoreOk = false;
+          }
+        }
+        if (cleanupOk && !(await pathExists(destPath))) {
+          try {
+            await fs.rename(backupPath, destPath);
+          } catch {
+            restoreOk = false;
+          }
+        } else {
+          restoreOk = false;
+        }
+      } else if (
+        existingStat?.isSymbolicLink() &&
+        removedExisting &&
+        previousLinkTarget
+      ) {
+        if (await pathExists(destPath)) {
+          try {
+            await removePathSafe(destPath);
+          } catch {
+            cleanupOk = false;
+            restoreOk = false;
+          }
+        }
+        if (cleanupOk && !(await pathExists(destPath))) {
+          const linkType = process.platform === 'win32' ? 'junction' : 'dir';
+          try {
+            await fs.symlink(previousLinkTarget, destPath, linkType);
+          } catch {
+            restoreOk = false;
+          }
+        } else {
+          restoreOk = false;
+        }
+      }
+
+      const hasValidManifest =
+        cleanupOk &&
+        restoreOk &&
+        (await pathExists(destPath)) &&
+        Boolean(await findManifestPath(destPath).catch(() => null));
+
+      if (autoDisabled && hasValidManifest) {
+        await toggleFn(dirName, true).catch(() => {});
+      }
+      throw err;
+    }
   } finally {
     await fs.rm(stageDir, { recursive: true, force: true }).catch(() => {});
   }

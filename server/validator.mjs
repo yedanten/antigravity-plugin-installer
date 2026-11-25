@@ -16,6 +16,8 @@ export const ALLOWED_MANIFEST_KEYS = new Set([
   'repository',
   'license',
   'keywords',
+  'category',
+  'extensions',
 ]);
 
 const VALID_NAME_RE = /^[a-z0-9]+(-[a-z0-9]+)*$/;
@@ -24,16 +26,18 @@ const VALID_LOGO_EXTS = new Set(['.svg', '.png', '.jpg', '.jpeg', '.webp']);
 /**
  * Parse JSON with comments (JSONC) and trailing commas safely without
  * corrupting string literals (such as https:// URLs).
+ * Strips a leading UTF-8 BOM (\uFEFF) if present.
  */
 export function parseJsonc(raw) {
+  const source = String(raw ?? '').replace(/^\uFEFF/, '');
   let out = '';
   let i = 0;
   let inString = false;
   let escaped = false;
 
-  while (i < raw.length) {
-    const ch = raw[i];
-    const next = raw[i + 1];
+  while (i < source.length) {
+    const ch = source[i];
+    const next = source[i + 1];
 
     if (inString) {
       out += ch;
@@ -57,13 +61,13 @@ export function parseJsonc(raw) {
 
     if (ch === '/' && next === '/') {
       i += 2;
-      while (i < raw.length && raw[i] !== '\n') i += 1;
+      while (i < source.length && source[i] !== '\n') i += 1;
       continue;
     }
 
     if (ch === '/' && next === '*') {
       i += 2;
-      while (i < raw.length && !(raw[i] === '*' && raw[i + 1] === '/')) {
+      while (i < source.length && !(source[i] === '*' && source[i + 1] === '/')) {
         i += 1;
       }
       i += 2;
@@ -130,6 +134,7 @@ async function isDirectory(p) {
 export async function findManifestPath(pluginDir) {
   const candidates = [
     path.join(pluginDir, '.antigravity-plugin', 'plugin.json'),
+    path.join(pluginDir, '.gemini-plugin', 'plugin.json'),
     path.join(pluginDir, 'plugin.json'),
   ];
   for (const candidate of candidates) {
@@ -197,10 +202,74 @@ async function collectMarkdownItems(dirPath) {
     .map((e) => e.name.replace(/\.md$/i, ''));
 }
 
+async function collectSidecars(pluginDir, errors) {
+  const names = new Set();
+
+  const sidecarsJsonPath = path.join(pluginDir, 'sidecars.json');
+  if (await exists(sidecarsJsonPath)) {
+    try {
+      const raw = await fs.readFile(sidecarsJsonPath, 'utf8');
+      const parsed = parseJsonc(raw);
+      if (Array.isArray(parsed)) {
+        parsed.forEach((item, idx) => {
+          const name = item && typeof item === 'object' ? (item.name || item.id) : item;
+          names.add(String(name || `sidecar-${idx + 1}`));
+        });
+      } else if (parsed && typeof parsed === 'object') {
+        if (Array.isArray(parsed.sidecars)) {
+          parsed.sidecars.forEach((item, idx) => {
+            const name = item && typeof item === 'object' ? (item.name || item.id) : item;
+            names.add(String(name || `sidecar-${idx + 1}`));
+          });
+        } else if (parsed.sidecars && typeof parsed.sidecars === 'object') {
+          for (const key of Object.keys(parsed.sidecars)) {
+            names.add(key);
+          }
+        } else {
+          for (const key of Object.keys(parsed)) {
+            names.add(key);
+          }
+        }
+      }
+    } catch (err) {
+      errors.push(`Invalid sidecars.json: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  const sidecarsDir = path.join(pluginDir, 'sidecars');
+  if (await isDirectory(sidecarsDir)) {
+    const entries = await fs.readdir(sidecarsDir, { withFileTypes: true });
+    for (const entry of entries) {
+      if (entry.name.startsWith('.')) continue;
+      if (!entry.isDirectory() && !entry.isSymbolicLink()) continue;
+      const sidecarManifestPath = path.join(sidecarsDir, entry.name, 'sidecar.json');
+      if (await exists(sidecarManifestPath)) {
+        try {
+          const raw = await fs.readFile(sidecarManifestPath, 'utf8');
+          parseJsonc(raw);
+        } catch (err) {
+          errors.push(
+            `Invalid sidecars/${entry.name}/sidecar.json: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+      }
+      names.add(entry.name);
+    }
+  }
+
+  return Array.from(names);
+}
+
 export async function validatePluginDir(pluginDir, { strict = false } = {}) {
   const errors = [];
   const warnings = [];
   const resolvedDir = path.resolve(pluginDir);
+  const emptyComponents = { skills: [], mcpServers: [], agents: [], rules: [], hasHooks: false, sidecars: [] };
+
+  const addWarning = (msg) => {
+    if (strict) errors.push(msg);
+    else warnings.push(msg);
+  };
 
   if (!(await isDirectory(resolvedDir))) {
     return {
@@ -209,7 +278,7 @@ export async function validatePluginDir(pluginDir, { strict = false } = {}) {
       warnings,
       manifest: null,
       manifestPath: null,
-      components: { skills: [], mcpServers: [], agents: [], rules: [], hasHooks: false },
+      components: emptyComponents,
     };
   }
 
@@ -217,7 +286,7 @@ export async function validatePluginDir(pluginDir, { strict = false } = {}) {
   if (!manifestPath) {
     const hasClaude = await exists(path.join(resolvedDir, '.claude-plugin', 'plugin.json'));
     const hasGemini = await exists(path.join(resolvedDir, 'gemini-extension.json'));
-    let hint = 'Expected plugin.json (or .antigravity-plugin/plugin.json) in the plugin root.';
+    let hint = 'Expected plugin.json (or .antigravity-plugin/plugin.json, .gemini-plugin/plugin.json) in the plugin root.';
     if (hasClaude || hasGemini) {
       hint += ' Detected a Claude Code or Gemini CLI extension; convert or add a plugin.json manifest first.';
     }
@@ -227,7 +296,7 @@ export async function validatePluginDir(pluginDir, { strict = false } = {}) {
       warnings,
       manifest: null,
       manifestPath: null,
-      components: { skills: [], mcpServers: [], agents: [], rules: [], hasHooks: false },
+      components: emptyComponents,
     };
   }
 
@@ -242,7 +311,7 @@ export async function validatePluginDir(pluginDir, { strict = false } = {}) {
       warnings,
       manifest: null,
       manifestPath,
-      components: { skills: [], mcpServers: [], agents: [], rules: [], hasHooks: false },
+      components: emptyComponents,
     };
   }
 
@@ -253,17 +322,30 @@ export async function validatePluginDir(pluginDir, { strict = false } = {}) {
       warnings,
       manifest: null,
       manifestPath,
-      components: { skills: [], mcpServers: [], agents: [], rules: [], hasHooks: false },
+      components: emptyComponents,
     };
   }
 
   // Check unknown top-level fields
   for (const key of Object.keys(manifest)) {
     if (!ALLOWED_MANIFEST_KEYS.has(key)) {
-      const msg = `Unknown top-level field "${key}" in plugin.json (silently discarded by Antigravity).`;
-      if (strict) errors.push(msg);
-      else warnings.push(msg);
+      addWarning(`Unknown top-level field "${key}" in plugin.json (silently discarded by Antigravity).`);
     }
+  }
+
+  // Warn (error in strict mode) on misplaced rule/config files at root
+  for (const ruleFile of ['AGENTS.md', 'GEMINI.md', 'CLAUDE.md']) {
+    if (await exists(path.join(resolvedDir, ruleFile))) {
+      addWarning(
+        `Misplaced "${ruleFile}" at plugin root (plugins load rules only from rules/; move it to rules/${ruleFile}).`,
+      );
+    }
+  }
+  if (await exists(path.join(resolvedDir, 'hooks', 'hooks.json'))) {
+    addWarning('Misplaced "hooks/hooks.json" (native Antigravity plugins load hooks only from root hooks.json).');
+  }
+  if (await exists(path.join(resolvedDir, '.mcp.json'))) {
+    addWarning('Misplaced ".mcp.json" (native Antigravity plugins use mcp_config.json at the plugin root).');
   }
 
   // Validate name
@@ -336,6 +418,7 @@ export async function validatePluginDir(pluginDir, { strict = false } = {}) {
   const skills = await collectSkills(resolvedDir, manifest.skills);
   const agents = await collectMarkdownItems(path.join(resolvedDir, 'agents'));
   const rules = await collectMarkdownItems(path.join(resolvedDir, 'rules'));
+  const sidecars = await collectSidecars(resolvedDir, errors);
 
   const mcpServers = [];
   const mcpConfigPath = path.join(resolvedDir, 'mcp_config.json');
@@ -343,12 +426,22 @@ export async function validatePluginDir(pluginDir, { strict = false } = {}) {
     try {
       const mcpRaw = await fs.readFile(mcpConfigPath, 'utf8');
       const mcpJson = parseJsonc(mcpRaw);
-      if (!mcpJson || typeof mcpJson !== 'object' || typeof mcpJson.mcpServers !== 'object') {
+      if (!mcpJson || typeof mcpJson !== 'object' || !mcpJson.mcpServers || typeof mcpJson.mcpServers !== 'object' || Array.isArray(mcpJson.mcpServers)) {
         errors.push('mcp_config.json must contain a top-level "mcpServers" object.');
       } else {
         for (const [serverName, cfg] of Object.entries(mcpJson.mcpServers)) {
           mcpServers.push(serverName);
-          if (!cfg || typeof cfg !== 'object' || (!cfg.command && !cfg.url && !cfg.serverUrl)) {
+          if (!cfg || typeof cfg !== 'object') {
+            errors.push(`MCP server "${serverName}" in mcp_config.json must be an object.`);
+            continue;
+          }
+          const hasHttp = Boolean(cfg.url || cfg.serverUrl);
+          const hasStdio = Boolean(cfg.command || cfg.args !== undefined || cfg.env !== undefined);
+          if (hasHttp && hasStdio) {
+            errors.push(
+              `MCP server "${serverName}" in mcp_config.json cannot specify both "url"/"serverUrl" and "command"/"args"/"env".`,
+            );
+          } else if (!cfg.command && !cfg.url && !cfg.serverUrl) {
             errors.push(`MCP server "${serverName}" in mcp_config.json must define "command" or "url".`);
           }
         }
@@ -382,6 +475,7 @@ export async function validatePluginDir(pluginDir, { strict = false } = {}) {
       agents,
       rules,
       hasHooks,
+      sidecars,
     },
   };
 }

@@ -1,3 +1,4 @@
+import { constants as fsConstants } from 'node:fs';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -12,6 +13,14 @@ const MIME_BY_EXT = {
   '.webp': 'image/webp',
 };
 
+let configWriteQueue = Promise.resolve();
+
+function runSerializedConfigWrite(task) {
+  const next = configWriteQueue.then(task, task);
+  configWriteQueue = next.catch(() => {});
+  return next;
+}
+
 export function getGlobalPluginsDir() {
   if (process.env.ANTIGRAVITY_PLUGINS_DIR) {
     return path.resolve(process.env.ANTIGRAVITY_PLUGINS_DIR);
@@ -22,6 +31,9 @@ export function getGlobalPluginsDir() {
 export function getBuiltinPluginsDir() {
   if (process.env.ANTIGRAVITY_BUILTIN_PLUGINS_DIR) {
     return path.resolve(process.env.ANTIGRAVITY_BUILTIN_PLUGINS_DIR);
+  }
+  if (process.env.ANTIGRAVITY_APP_DATA_DIR) {
+    return path.join(path.resolve(process.env.ANTIGRAVITY_APP_DATA_DIR), 'builtin', 'plugins');
   }
   return path.join(os.homedir(), '.gemini', 'antigravity', 'builtin', 'plugins');
 }
@@ -47,24 +59,188 @@ export function expandHomePath(rawPath) {
   return path.resolve(cleaned);
 }
 
-/**
- * Read-only inspection of ~/.gemini/config/config.json to display accurate
- * enabled/disabled badges. Never mutates config.json.
- */
-async function readEnabledOverrides() {
-  const configPath =
-    process.env.ANTIGRAVITY_CONFIG_PATH ||
-    path.join(os.homedir(), '.gemini', 'config', 'config.json');
+async function isExecutableFile(candidate) {
   try {
-    const raw = await fs.readFile(configPath, 'utf8');
-    const json = parseJsonc(raw);
-    if (json && typeof json.plugins === 'object' && json.plugins !== null) {
+    const st = await fs.stat(candidate);
+    if (!st.isFile()) return false;
+    if (process.platform !== 'win32') {
+      await fs.access(candidate, fsConstants.X_OK);
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export async function resolveAgyPath() {
+  const pathEnv = process.env.PATH || '';
+  const pathDirs = pathEnv
+    .split(path.delimiter)
+    .map((dir) => dir.trim())
+    .filter(Boolean);
+
+  const binNames = process.platform === 'win32' ? ['agy.exe', 'agy.cmd', 'agy'] : ['agy'];
+
+  for (const dir of pathDirs) {
+    for (const binName of binNames) {
+      const candidate = path.join(dir, binName);
+      if (await isExecutableFile(candidate)) {
+        return candidate;
+      }
+    }
+  }
+
+  const fallbackBin = process.platform === 'win32' ? 'agy.exe' : 'agy';
+  const homeCandidate = path.join(os.homedir(), '.gemini', 'bin', fallbackBin);
+  if (await isExecutableFile(homeCandidate)) {
+    return homeCandidate;
+  }
+
+  return null;
+}
+
+export function getConfigPath() {
+  if (process.env.ANTIGRAVITY_CONFIG_PATH) {
+    return path.resolve(process.env.ANTIGRAVITY_CONFIG_PATH);
+  }
+  return path.join(os.homedir(), '.gemini', 'config', 'config.json');
+}
+
+export async function readAntigravityConfig() {
+  const configPath = getConfigPath();
+  let raw;
+  try {
+    raw = await fs.readFile(configPath, 'utf8');
+  } catch (err) {
+    if (err && err.code === 'ENOENT') {
+      return {};
+    }
+    throw err;
+  }
+
+  if (!raw.trim()) {
+    return {};
+  }
+
+  const parsed = parseJsonc(raw);
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error(`Invalid Antigravity config at ${configPath}: expected a JSON object.`);
+  }
+  return parsed;
+}
+
+/**
+ * Inspect ~/.gemini/config/config.json to read plugin enablement overrides.
+ */
+export async function readEnabledOverrides() {
+  try {
+    const json = await readAntigravityConfig();
+    if (json && typeof json.plugins === 'object' && json.plugins !== null && !Array.isArray(json.plugins)) {
       return json.plugins;
     }
   } catch {
-    // Missing or unreadable config.json is fine
+    // Missing or unreadable config.json falls back to manifest defaults
   }
   return {};
+}
+
+export async function isSamePath(a, b) {
+  if (!a || !b) return false;
+  const resolveReal = async (targetPath) => {
+    const resolved = path.resolve(targetPath);
+    try {
+      return await fs.realpath(resolved);
+    } catch {
+      return resolved;
+    }
+  };
+  const [realA, realB] = await Promise.all([resolveReal(a), resolveReal(b)]);
+  if (process.platform === 'win32') {
+    return realA.toLowerCase() === realB.toLowerCase();
+  }
+  return realA === realB;
+}
+
+export function validatePluginDirName(dirName) {
+  if (
+    !dirName ||
+    typeof dirName !== 'string' ||
+    dirName.trim() !== dirName ||
+    dirName === '.' ||
+    dirName === '..' ||
+    dirName.includes('/') ||
+    dirName.includes('\\') ||
+    /[\u0000-\u001f\u007f]/.test(dirName) ||
+    dirName === '__proto__' ||
+    dirName === 'constructor' ||
+    dirName === 'prototype'
+  ) {
+    throw new Error(`Invalid plugin directory name: "${String(dirName)}"`);
+  }
+}
+
+export async function setPluginEnabled(dirName, enabled) {
+  validatePluginDirName(dirName);
+  const nextEnabled = Boolean(enabled);
+
+  return runSerializedConfigWrite(async () => {
+    const configPath = getConfigPath();
+    const config = await readAntigravityConfig();
+
+    const existingPlugins =
+      config.plugins && typeof config.plugins === 'object' && !Array.isArray(config.plugins)
+        ? { ...config.plugins }
+        : {};
+
+    const previousEntry =
+      Object.hasOwn(existingPlugins, dirName) &&
+      existingPlugins[dirName] &&
+      typeof existingPlugins[dirName] === 'object' &&
+      !Array.isArray(existingPlugins[dirName])
+        ? { ...existingPlugins[dirName] }
+        : {};
+
+    const previousEnabled =
+      typeof previousEntry.enabled === 'boolean' ? previousEntry.enabled : undefined;
+
+    existingPlugins[dirName] = {
+      ...previousEntry,
+      enabled: nextEnabled,
+    };
+
+    const nextConfig = {
+      ...config,
+      plugins: existingPlugins,
+    };
+
+    const configDir = path.dirname(configPath);
+    await fs.mkdir(configDir, { recursive: true });
+    const tmpPath = path.join(
+      configDir,
+      `.${path.basename(configPath)}.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2)}.tmp`,
+    );
+
+    try {
+      await fs.writeFile(tmpPath, `${JSON.stringify(nextConfig, null, 2)}\n`, {
+        encoding: 'utf8',
+        mode: 0o600,
+      });
+      if (process.platform !== 'win32') {
+        await fs.chmod(tmpPath, 0o600).catch(() => {});
+      }
+      await fs.rename(tmpPath, configPath);
+    } catch (err) {
+      await fs.rm(tmpPath, { force: true }).catch(() => {});
+      throw err;
+    }
+
+    return {
+      dir: dirName,
+      enabled: nextEnabled,
+      previousEnabled,
+      configPath,
+    };
+  });
 }
 
 export class InstallRegistry {
@@ -180,7 +356,7 @@ async function scanPluginsRoot(rootDir, scope, overrides, registryEntries, works
 
     const validation = await validatePluginDir(fullPath, { strict: false });
     const manifest = validation.manifest || {};
-    const override = overrides[entry.name];
+    const override = Object.hasOwn(overrides, entry.name) ? overrides[entry.name] : undefined;
     const enabled =
       override && typeof override.enabled === 'boolean'
         ? override.enabled
@@ -271,7 +447,7 @@ export async function listInstalledPlugins({ registry, workspacePath = '' } = {}
   };
 }
 
-export async function uninstallPlugin({ dir, scope = 'global', workspacePath = '', registry }) {
+export async function uninstallPlugin({ dir, scope = 'global', workspacePath = '', registry, pluginRoot = '' }) {
   if (!dir || typeof dir !== 'string' || dir.includes('/') || dir.includes('\\') || dir === '.' || dir === '..') {
     throw new Error('Invalid plugin directory name.');
   }
@@ -297,6 +473,14 @@ export async function uninstallPlugin({ dir, scope = 'global', workspacePath = '
     lstat = await fs.lstat(targetPath);
   } catch {
     throw new Error(`Plugin "${dir}" not found at ${targetPath}.`);
+  }
+
+  if (pluginRoot && (await isSamePath(targetPath, pluginRoot))) {
+    const selfErr = new Error(
+      'Cannot uninstall Plugin Installer from its own panel because doing so would delete its running MCP server and UI.',
+    );
+    selfErr.code = 'SELF_UNINSTALL_BLOCKED';
+    throw selfErr;
   }
 
   if (lstat.isSymbolicLink()) {
