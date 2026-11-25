@@ -2,7 +2,7 @@
   "$schema": "https://antigravity.google/schemas/v1/plugin.json",
   "name": "plugin-installer",
   "displayName": "Plugin Installer",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Visual plugin installer and manager for installing custom plugins from GitHub repositories, npm packages, or local directories.",
   "logo": "assets/logo.svg",
   "suggestedPrompts": [
