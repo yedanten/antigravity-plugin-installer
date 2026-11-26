@@ -13,7 +13,6 @@ import {
   isSamePath,
   listInstalledPlugins,
   registryKey,
-  setPluginEnabled,
   uninstallPlugin,
 } from './plugins.mjs';
 
@@ -329,6 +328,9 @@ server.registerTool(
           ok: false,
           error: message,
           code: err?.code || 'INSTALL_FAILED',
+          locked: Boolean(err?.locked),
+          alreadyDisabled: Boolean(err?.alreadyDisabled),
+          customizationUri: err?.customizationUri || null,
           existingDir: err?.existingDir || null,
         },
       };
@@ -465,84 +467,9 @@ server.registerTool(
           ok: false,
           error: message,
           code: err?.code || 'REINSTALL_FAILED',
-        },
-      };
-    }
-  },
-);
-
-server.registerTool(
-  {
-    name: 'app_set_plugin_enabled',
-    title: 'Set Plugin Enabled (App)',
-    description: 'Enable or disable an installed Antigravity plugin in config.json.',
-    inputSchema: {
-      type: 'object',
-      required: ['dir', 'enabled'],
-      properties: {
-        dir: { type: 'string' },
-        scope: { type: 'string', enum: ['global', 'workspace', 'builtin'] },
-        workspacePath: { type: 'string' },
-        enabled: { type: 'boolean' },
-      },
-      additionalProperties: false,
-    },
-    _meta: APP_ONLY_META,
-  },
-  async (args = {}) => {
-    try {
-      if (typeof args.enabled !== 'boolean') {
-        throw new Error('Field "enabled" must be a boolean.');
-      }
-
-      const workspacePath = typeof args.workspacePath === 'string' ? args.workspacePath : '';
-      const scope = typeof args.scope === 'string' ? args.scope : '';
-      const initialInventory = await listInstalledPlugins({ registry: installRegistry, workspacePath });
-      const target = initialInventory.plugins.find(
-        (p) => p.dir === args.dir && (!scope || p.scope === scope),
-      );
-
-      if (!target) {
-        throw new Error(
-          `Plugin "${String(args.dir)}" not found${scope ? ` in ${scope} scope` : ''}.`,
-        );
-      }
-
-      if (!args.enabled && (await isSamePath(target.path, PLUGIN_ROOT))) {
-        const selfErr = new Error(
-          'Cannot disable Plugin Installer from its own panel because doing so would terminate its active MCP server and UI.',
-        );
-        selfErr.code = 'SELF_DISABLE_BLOCKED';
-        throw selfErr;
-      }
-
-      await setPluginEnabled(target.dir, args.enabled);
-      const inventory = await listInstalledPlugins({ registry: installRegistry, workspacePath });
-
-      return {
-        content: [
-          {
-            type: 'text',
-            text: `${args.enabled ? 'Enabled' : 'Disabled'} ${target.displayName} (${target.dir}).`,
-          },
-        ],
-        structuredContent: {
-          ok: true,
-          dir: target.dir,
-          scope: target.scope,
-          enabled: Boolean(args.enabled),
-          inventory,
-        },
-      };
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      return {
-        isError: false,
-        content: [{ type: 'text', text: message }],
-        structuredContent: {
-          ok: false,
-          error: message,
-          code: err?.code || 'SET_ENABLED_FAILED',
+          locked: Boolean(err?.locked),
+          alreadyDisabled: Boolean(err?.alreadyDisabled),
+          customizationUri: err?.customizationUri || null,
         },
       };
     }

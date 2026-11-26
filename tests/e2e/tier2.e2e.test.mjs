@@ -141,14 +141,11 @@ describe('Tier 2: Boundary, Error & Edge Cases (32 cases)', () => {
       const init = await mcp.initialize();
       assert.equal(init.serverInfo.name, 'plugin-installer');
 
-      const toggle = await mcp.callTool('app_set_plugin_enabled', {
-        dir: 'no-path-p',
-        scope: 'global',
-        enabled: false,
-      });
-      assert.equal(toggle.structuredContent.ok, true);
-      const cfg = await sandbox.readConfig();
-      assert.equal(cfg.plugins['no-path-p'].enabled, false);
+      const listRes = await mcp.callTool('app_list_plugins', {});
+      const plugin = listRes.structuredContent.plugins.find((p) => p.dir === 'no-path-p');
+      assert.ok(plugin);
+      assert.equal(plugin.enabled, true);
+      assert.equal(plugin.customizationUri, 'customization://no-path-p');
     } finally {
       await mcp.close();
       await sandbox.cleanup();
@@ -210,7 +207,7 @@ describe('Tier 2: Boundary, Error & Edge Cases (32 cases)', () => {
     }
   });
 
-  test('E2E-T2-F2-03: Corrupted JSON in config.json stays up on list and refuses destructive overwrite on toggle', async () => {
+  test('E2E-T2-F2-03: Corrupted JSON in config.json stays up on list without touching config.json', async () => {
     const sandbox = await createSandbox();
     const mcp = spawnMcpClient({ dataDir: sandbox.dataDir, env: sandbox.env() });
     try {
@@ -222,13 +219,6 @@ describe('Tier 2: Boundary, Error & Edge Cases (32 cases)', () => {
       const listRes = await mcp.callTool('app_list_plugins', {});
       assert.equal(listRes.structuredContent.ok, true);
       assert.equal(listRes.structuredContent.plugins.length, 1);
-
-      const toggleRes = await mcp.callTool('app_set_plugin_enabled', {
-        dir: 'p1',
-        scope: 'global',
-        enabled: false,
-      });
-      assert.equal(toggleRes.structuredContent.ok, false);
       assert.equal(await sandbox.readConfigRaw(), broken);
     } finally {
       await mcp.close();
@@ -295,49 +285,50 @@ describe('Tier 2: Boundary, Error & Edge Cases (32 cases)', () => {
   });
 
   // =========================================================================
-  // F3: app_set_plugin_enabled Safety, Validation & Concurrency (6 cases)
+  // F3: Config.json Non-Mutation Guarantee & Removed Direct Toggle Tool (2 cases)
   // =========================================================================
 
-  test('E2E-T2-F3-01: app_set_plugin_enabled rejects path traversal dir values', async () => {
+  test('E2E-T2-F3-01: Removed app_set_plugin_enabled tool is rejected by MCP server without mutating config.json', async () => {
     const sandbox = await createSandbox();
     const mcp = spawnMcpClient({ dataDir: sandbox.dataDir, env: sandbox.env() });
     try {
-      await sandbox.writeConfig({ plugins: { safe: { enabled: true } } });
+      await sandbox.placeInstalledPlugin('global', 'safe');
+      const initialCfg = JSON.stringify({ plugins: { safe: { enabled: true } } }, null, 2);
+      await sandbox.writeConfig(initialCfg);
       await mcp.initialize();
 
-      for (const badDir of ['../evil', 'a/b', 'a\\b', '.', '..', '']) {
-        const res = await mcp.callTool('app_set_plugin_enabled', {
-          dir: badDir,
-          enabled: false,
-        });
-        assert.equal(res.structuredContent.ok, false, `Expected failure for "${badDir}"`);
-      }
+      await assert.rejects(
+        () =>
+          mcp.callTool('app_set_plugin_enabled', {
+            dir: 'safe',
+            scope: 'global',
+            enabled: false,
+          }),
+        /Unknown tool|not found/i,
+      );
 
-      const cfg = await sandbox.readConfig();
-      assert.deepEqual(cfg, { plugins: { safe: { enabled: true } } });
+      assert.equal(await sandbox.readConfigRaw(), initialCfg);
     } finally {
       await mcp.close();
       await sandbox.cleanup();
     }
   });
 
-  test('E2E-T2-F3-02: app_set_plugin_enabled rejects non-boolean enabled and missing dir', async () => {
+  test('E2E-T2-F3-02: Install, list, and uninstall never create or mutate config.json', async () => {
     const sandbox = await createSandbox();
     const mcp = spawnMcpClient({ dataDir: sandbox.dataDir, env: sandbox.env() });
     try {
-      await sandbox.placeInstalledPlugin('global', 'p1');
+      const srcDir = await sandbox.createPluginSource('no-cfg-touch', {
+        manifest: { name: 'no-cfg-touch', version: '1.0.0' },
+      });
       await mcp.initialize();
 
-      const badBool = await mcp.callTool('app_set_plugin_enabled', {
-        dir: 'p1',
-        enabled: 'false',
-      });
-      assert.equal(badBool.structuredContent.ok, false);
-
-      const missingDir = await mcp.callTool('app_set_plugin_enabled', {
-        enabled: false,
-      });
-      assert.equal(missingDir.structuredContent.ok, false);
+      const inst = await mcp.callTool('app_install_plugin', { source: srcDir });
+      assert.equal(inst.structuredContent.ok, true);
+      const list = await mcp.callTool('app_list_plugins', {});
+      assert.equal(list.structuredContent.plugins.length, 1);
+      const uninst = await mcp.callTool('app_uninstall_plugin', { dir: 'no-cfg-touch', scope: 'global' });
+      assert.equal(uninst.structuredContent.ok, true);
 
       await assert.rejects(() => fs.stat(sandbox.configPath), { code: 'ENOENT' });
     } finally {
@@ -346,188 +337,11 @@ describe('Tier 2: Boundary, Error & Edge Cases (32 cases)', () => {
     }
   });
 
-  test('E2E-T2-F3-03: Self-disable guard blocks disabling live plugin-installer (PLUGIN_ROOT)', async () => {
-    const sandbox = await createSandbox();
-    const selfCopy = await sandbox.stageSandboxedSelfCopy();
-    const mcp = spawnMcpClient({
-      serverEntry: selfCopy.serverEntry,
-      dataDir: sandbox.dataDir,
-      env: sandbox.env(),
-    });
-    try {
-      await mcp.initialize();
-      const res = await mcp.callTool('app_set_plugin_enabled', {
-        dir: 'plugin-installer',
-        scope: 'global',
-        enabled: false,
-      });
-      assert.equal(res.structuredContent.ok, false);
-      assert.equal(res.structuredContent.code, 'SELF_DISABLE_BLOCKED');
-
-      const cfg = await sandbox.readConfig();
-      assert.equal(cfg.plugins['plugin-installer'].enabled, true);
-    } finally {
-      await mcp.close();
-      await sandbox.cleanup();
-    }
-  });
-
-  test('E2E-T2-F3-04: Concurrent app_set_plugin_enabled calls serialize without losing writes', async () => {
-    const sandbox = await createSandbox();
-    const mcp = spawnMcpClient({ dataDir: sandbox.dataDir, env: sandbox.env() });
-    try {
-      await sandbox.placeInstalledPlugin('global', 'p1');
-      await sandbox.placeInstalledPlugin('global', 'p2');
-      await sandbox.placeInstalledPlugin('global', 'p3');
-      await sandbox.writeConfig({ plugins: { p2: { enabled: false } } });
-      await mcp.initialize();
-
-      const results = await Promise.all([
-        mcp.callTool('app_set_plugin_enabled', { dir: 'p1', scope: 'global', enabled: false }),
-        mcp.callTool('app_set_plugin_enabled', { dir: 'p2', scope: 'global', enabled: true }),
-        mcp.callTool('app_set_plugin_enabled', { dir: 'p3', scope: 'global', enabled: false }),
-      ]);
-      for (const r of results) {
-        assert.equal(r.structuredContent.ok, true);
-      }
-
-      const cfg = await sandbox.readConfig();
-      assert.equal(cfg.plugins.p1.enabled, false);
-      assert.equal(cfg.plugins.p2.enabled, true);
-      assert.equal(cfg.plugins.p3.enabled, false);
-    } finally {
-      await mcp.close();
-      await sandbox.cleanup();
-    }
-  });
-
-  test('E2E-T2-F3-05: app_set_plugin_enabled creates config.json and parent dirs when initially absent', async () => {
-    const sandbox = await createSandbox();
-    const nestedCfg = path.join(sandbox.root, 'fresh', 'nested', 'config.json');
-    const mcp = spawnMcpClient({
-      dataDir: sandbox.dataDir,
-      env: sandbox.env({ ANTIGRAVITY_CONFIG_PATH: nestedCfg }),
-    });
-    try {
-      await sandbox.placeInstalledPlugin('global', 'p1');
-      await mcp.initialize();
-
-      const res = await mcp.callTool('app_set_plugin_enabled', {
-        dir: 'p1',
-        scope: 'global',
-        enabled: false,
-      });
-      assert.equal(res.structuredContent.ok, true);
-
-      const cfg = await sandbox.readConfig(nestedCfg);
-      assert.equal(cfg.plugins.p1.enabled, false);
-    } finally {
-      await mcp.close();
-      await sandbox.cleanup();
-    }
-  });
-
-  test('E2E-T2-F3-06: app_set_plugin_enabled for nonexistent plugin dir returns clear error without mutating config.json', async () => {
-    const sandbox = await createSandbox();
-    const mcp = spawnMcpClient({ dataDir: sandbox.dataDir, env: sandbox.env() });
-    try {
-      await sandbox.writeConfig({ plugins: { existing: { enabled: true } } });
-      await mcp.initialize();
-
-      const res = await mcp.callTool('app_set_plugin_enabled', {
-        dir: 'does-not-exist',
-        scope: 'global',
-        enabled: false,
-      });
-      assert.equal(res.structuredContent.ok, false);
-      assert.match(res.structuredContent.error, /not found/i);
-
-      const cfg = await sandbox.readConfig();
-      assert.deepEqual(cfg, { plugins: { existing: { enabled: true } } });
-    } finally {
-      await mcp.close();
-      await sandbox.cleanup();
-    }
-  });
-
   // =========================================================================
-  // F4: UI Toggle Edge Cases, Filters, Busy State & Viewport (5 cases)
+  // F4: UI Filter, Built-in Native Guide & Narrow Viewport Edge Cases (3 cases)
   // =========================================================================
 
-  test('E2E-T2-F4-01: Toggle control enters disabled/busy state while in-flight and prevents double-submit', async () => {
-    const sandbox = await createSandbox();
-    const mcp = spawnMcpClient({ dataDir: sandbox.dataDir, env: sandbox.env() });
-    let session;
-    try {
-      await sandbox.placeInstalledPlugin('global', 'slow-p', {
-        manifest: { name: 'slow-p', displayName: 'Slow P', version: '1.0.0' },
-      });
-      await mcp.initialize();
-
-      session = await browser.openAppSession({
-        mcpClient: mcp,
-        toolDelayMs: 900,
-        toolDelayFor: 'app_set_plugin_enabled',
-      });
-
-      await session.clickCardToggle('global:slow-p');
-      // Immediately verify the toggle is disabled while in-flight and try clicking again
-      const midState = await session.evalInApp((doc) => {
-        const card = doc.querySelector('.plugin-card[data-plugin-id="global:slow-p"]');
-        const sw = card?.querySelector('[role="switch"], [aria-checked]');
-        const disabledWhileBusy = Boolean(sw?.disabled || sw?.getAttribute('aria-disabled') === 'true');
-        sw?.click();
-        return { disabledWhileBusy };
-      });
-      assert.equal(midState.disabledWhileBusy, true);
-
-      await session.waitFor(
-        (doc) => {
-          const card = doc.querySelector('.plugin-card[data-plugin-id="global:slow-p"]');
-          const sw = card?.querySelector('[role="switch"], [aria-checked]');
-          return sw?.getAttribute('aria-checked') === 'false' && !sw.disabled;
-        },
-        [],
-        { label: 'slow-p toggle settled to false' },
-      );
-
-      const calls = await session.getToolCalls();
-      const setCalls = calls.filter((c) => c.name === 'app_set_plugin_enabled');
-      assert.equal(setCalls.length, 1);
-    } finally {
-      if (session) await session.close();
-      await mcp.close();
-      await sandbox.cleanup();
-    }
-  });
-
-  test('E2E-T2-F4-02: UI displays error toast and keeps actual state when app_set_plugin_enabled fails', async () => {
-    const sandbox = await createSandbox();
-    const selfCopy = await sandbox.stageSandboxedSelfCopy();
-    const mcp = spawnMcpClient({
-      serverEntry: selfCopy.serverEntry,
-      dataDir: sandbox.dataDir,
-      env: sandbox.env(),
-    });
-    let session;
-    try {
-      await mcp.initialize();
-      session = await browser.openAppSession({ mcpClient: mcp });
-
-      await session.clickCardToggle('global:plugin-installer');
-      await session.waitForSelector('.toast.error');
-
-      const card = await session.getCardInfo('global:plugin-installer');
-      assert.equal(card.ariaChecked, 'true');
-      assert.ok(card.badges.some((b) => /Enabled|已启用/i.test(b)));
-    } finally {
-      if (session) await session.close();
-      await mcp.close();
-      await sandbox.cleanup();
-    }
-  });
-
-  test('E2E-T2-F4-03: Filter tabs and search keep toggle state accurate', async () => {
+  test('E2E-T2-F4-01: Filter tabs and search keep read-only status badges accurate', async () => {
     const sandbox = await createSandbox();
     const mcp = spawnMcpClient({ dataDir: sandbox.dataDir, env: sandbox.env() });
     let session;
@@ -541,6 +355,7 @@ describe('Tier 2: Boundary, Error & Edge Cases (32 cases)', () => {
       await sandbox.placeInstalledPlugin('builtin', 'gamma-bi', {
         manifest: { name: 'gamma-bi', displayName: 'Gamma Builtin', version: '1.0.0' },
       });
+      await sandbox.writeConfig({ plugins: { 'alpha-global': { enabled: false } } });
 
       await mcp.initialize();
       session = await browser.openAppSession({ mcpClient: mcp });
@@ -551,17 +366,13 @@ describe('Tier 2: Boundary, Error & Edge Cases (32 cases)', () => {
       await session.click('[data-action="apply-workspace"]');
       await session.waitForSelector('.plugin-card[data-plugin-id="workspace:beta-ws"]');
 
-      // Toggle alpha-global disabled
-      await session.clickCardToggle('global:alpha-global');
-      await session.waitForToggleState('global:alpha-global', false);
-
       // Filter to Installed (user) and search "Alpha"
       await session.click('[data-action="set-filter"][data-value="user"]');
       await session.setInputValue('#plugin-search-input', 'Alpha');
 
       const alphaCard = await session.getCardInfo('global:alpha-global');
       assert.equal(alphaCard.exists, true);
-      assert.equal(alphaCard.ariaChecked, 'false');
+      assert.equal(alphaCard.toggleExists, false);
       assert.ok(alphaCard.badges.some((b) => /Disabled|已禁用/i.test(b)));
       const betaCard = await session.getCardInfo('workspace:beta-ws');
       assert.equal(betaCard.exists, false);
@@ -571,7 +382,7 @@ describe('Tier 2: Boundary, Error & Edge Cases (32 cases)', () => {
       await session.click('[data-action="set-filter"][data-value="builtin"]');
       const gammaCard = await session.getCardInfo('builtin:gamma-bi');
       assert.equal(gammaCard.exists, true);
-      assert.equal(gammaCard.ariaChecked, 'true');
+      assert.ok(gammaCard.badges.some((b) => /Enabled|已启用/i.test(b)));
     } finally {
       if (session) await session.close();
       await mcp.close();
@@ -579,26 +390,26 @@ describe('Tier 2: Boundary, Error & Edge Cases (32 cases)', () => {
     }
   });
 
-  test('E2E-T2-F4-04: Built-in plugin card toggle works consistently in headless Edge', async () => {
+  test('E2E-T2-F4-02: Built-in plugin card shows native management guide without uninstall button', async () => {
     const sandbox = await createSandbox();
     const mcp = spawnMcpClient({ dataDir: sandbox.dataDir, env: sandbox.env() });
     let session;
     try {
-      await sandbox.placeInstalledPlugin('builtin', 'bi-toggle', {
-        manifest: { name: 'bi-toggle', displayName: 'BI Toggle', version: '1.0.0' },
+      await sandbox.placeInstalledPlugin('builtin', 'bi-guide', {
+        manifest: { name: 'bi-guide', displayName: 'BI Guide', version: '1.0.0' },
       });
       await mcp.initialize();
       session = await browser.openAppSession({ mcpClient: mcp });
 
-      const beforeCard = await session.getCardInfo('builtin:bi-toggle');
-      assert.equal(beforeCard.toggleExists, true);
-      assert.equal(beforeCard.ariaChecked, 'true');
+      const beforeCard = await session.getCardInfo('builtin:bi-guide');
+      assert.equal(beforeCard.toggleExists, false);
+      assert.equal(beforeCard.manageBtnExists, true);
 
-      await session.clickCardToggle('builtin:bi-toggle');
-      await session.waitForToggleState('builtin:bi-toggle', false);
+      await session.click('.plugin-card[data-plugin-id="builtin:bi-guide"] [data-action="toggle-manage-native"]');
+      await session.waitForSelector('.plugin-card[data-plugin-id="builtin:bi-guide"] .native-guide-box');
 
-      const cfg = await sandbox.readConfig();
-      assert.equal(cfg.plugins['bi-toggle'].enabled, false);
+      const afterCard = await session.getCardInfo('builtin:bi-guide');
+      assert.ok(afterCard.nativeGuideText.includes('customization://bi-guide'));
     } finally {
       if (session) await session.close();
       await mcp.close();
@@ -606,7 +417,7 @@ describe('Tier 2: Boundary, Error & Edge Cases (32 cases)', () => {
     }
   });
 
-  test('E2E-T2-F4-05: Dark theme and narrow aux-pane width (420px) render toggle cleanly without clipping', async () => {
+  test('E2E-T2-F4-03: Dark theme and narrow aux-pane width (420px) render card and native guide cleanly without clipping', async () => {
     const sandbox = await createSandbox();
     const mcp = spawnMcpClient({ dataDir: sandbox.dataDir, env: sandbox.env() });
     let session;
@@ -617,6 +428,7 @@ describe('Tier 2: Boundary, Error & Edge Cases (32 cases)', () => {
       await mcp.initialize();
       session = await browser.openAppSession({
         mcpClient: mcp,
+        hostCapabilities: { serverTools: {}, openLinks: {}, message: {} },
         viewport: { width: 420, height: 700 },
       });
 
@@ -624,14 +436,15 @@ describe('Tier 2: Boundary, Error & Edge Cases (32 cases)', () => {
       const themeAttr = await session.evalInApp((doc) => doc.documentElement.getAttribute('data-theme'));
       assert.equal(themeAttr, 'dark');
 
-      const card = await session.getCardInfo('global:narrow-p');
-      assert.equal(card.toggleExists, true);
-      assert.ok(card.toggleRect && card.toggleRect.width > 0 && card.toggleRect.height > 0);
-      assert.ok(card.toggleRect.right <= card.viewportWidth + 1, `Toggle overflows right: ${JSON.stringify(card)}`);
-      assert.ok(card.scrollWidth <= card.viewportWidth + 1, `Horizontal scroll overflow: ${card.scrollWidth} > ${card.viewportWidth}`);
+      await session.click('.plugin-card[data-plugin-id="global:narrow-p"] [data-action="toggle-manage-native"]');
+      await session.waitForSelector('.plugin-card[data-plugin-id="global:narrow-p"] .native-guide-box');
 
-      await session.clickCardToggle('global:narrow-p');
-      await session.waitForToggleState('global:narrow-p', false);
+      const card = await session.getCardInfo('global:narrow-p');
+      assert.equal(card.toggleExists, false);
+      assert.equal(card.nativeGuideExists, true);
+      assert.equal(card.sendChatBtnExists, true);
+      assert.ok(card.manageBtnRect && card.manageBtnRect.right <= card.viewportWidth + 1);
+      assert.ok(card.scrollWidth <= card.viewportWidth + 1, `Horizontal scroll overflow: ${card.scrollWidth} > ${card.viewportWidth}`);
     } finally {
       if (session) await session.close();
       await mcp.close();
@@ -640,10 +453,10 @@ describe('Tier 2: Boundary, Error & Edge Cases (32 cases)', () => {
   });
 
   // =========================================================================
-  // F5: Locking, Retry, Symlink & Update Boundaries (5 cases)
+  // F5: Locking, Retry, Symlink & Update Boundaries (4 cases)
   // =========================================================================
 
-  test('E2E-T2-F5-01: Persistent unreleasing lock fails cleanly within bounded retries without hanging', async () => {
+  test('E2E-T2-F5-01: Persistent unreleasing lock fails cleanly within bounded retries with customizationUri and no config.json write', async () => {
     const sandbox = await createSandbox();
     const mcp = spawnMcpClient({ dataDir: sandbox.dataDir, env: sandbox.env() });
     let lock;
@@ -672,8 +485,11 @@ describe('Tier 2: Boundary, Error & Edge Cases (32 cases)', () => {
         { timeoutMs: 20000 },
       );
       assert.equal(res.structuredContent.ok, false);
+      assert.equal(res.structuredContent.locked, true);
+      assert.equal(res.structuredContent.customizationUri, 'customization://stuck-p');
       assert.match(res.structuredContent.error, /locked|EBUSY|EPERM/i);
       assert.equal(lock.isAlive(), true);
+      await assert.rejects(() => fs.stat(sandbox.configPath), { code: 'ENOENT' });
     } finally {
       if (lock) await lock.forceKill();
       await mcp.close();
@@ -681,51 +497,7 @@ describe('Tier 2: Boundary, Error & Edge Cases (32 cases)', () => {
     }
   });
 
-  test('E2E-T2-F5-02: Transient EBUSY requiring multiple retries succeeds and restores enabled: true', async () => {
-    const sandbox = await createSandbox();
-    const mcp = spawnMcpClient({ dataDir: sandbox.dataDir, env: sandbox.env() });
-    let lock;
-    try {
-      const srcDir = await sandbox.createPluginSource('retry-p', {
-        manifest: { name: 'retry-p', displayName: 'Retry P', version: '1.0.0' },
-        files: { 'marker.txt': 'v1' },
-      });
-      await mcp.initialize();
-      await mcp.callTool('app_install_plugin', { source: srcDir });
-
-      const installedDir = path.join(sandbox.globalPluginsDir, 'retry-p');
-      lock = await spawnLockedPluginProcess({
-        pluginDir: installedDir,
-        configPath: sandbox.configPath,
-        dirName: 'retry-p',
-        releaseOnDisable: true,
-        releaseDelayMs: 750, // Longer than 400ms settle so removeExistingWithRetry hits EBUSY and retries
-      });
-      sandbox.trackChild(lock.child);
-
-      await sandbox.createPluginSource('retry-p', {
-        targetDir: srcDir,
-        manifest: { name: 'retry-p', displayName: 'Retry P', version: '2.0.0' },
-        files: { 'marker.txt': 'v2' },
-      });
-
-      const res = await mcp.callTool('app_reinstall_plugin', { dir: 'retry-p', scope: 'global' });
-      assert.equal(res.structuredContent.ok, true, res.structuredContent.error);
-      await lock.waitForExit(5000);
-      assert.equal(lock.wasReleasedByConfigDisable(), true);
-
-      const marker = await fs.readFile(path.join(installedDir, 'marker.txt'), 'utf8');
-      assert.equal(marker, 'v2');
-      const cfg = await sandbox.readConfig();
-      assert.equal(cfg.plugins['retry-p'].enabled, true);
-    } finally {
-      if (lock) await lock.forceKill();
-      await mcp.close();
-      await sandbox.cleanup();
-    }
-  });
-
-  test('E2E-T2-F5-03: Symlink/junction local plugin (mode: link) updates cleanly when enabled without deleting source', async () => {
+  test('E2E-T2-F5-02: Symlink/junction local plugin (mode: link) updates cleanly without deleting source or touching config.json', async () => {
     const sandbox = await createSandbox();
     const mcp = spawnMcpClient({ dataDir: sandbox.dataDir, env: sandbox.env() });
     try {
@@ -752,60 +524,48 @@ describe('Tier 2: Boundary, Error & Edge Cases (32 cases)', () => {
         scope: 'global',
       });
       assert.equal(reinstallRes.structuredContent.ok, true);
-      assert.equal(reinstallRes.structuredContent.install.wasEnabled, true);
-      assert.equal(reinstallRes.structuredContent.install.restoredEnabled, true);
 
       const srcContent = await fs.readFile(path.join(srcDir, 'src-file.txt'), 'utf8');
       assert.equal(srcContent, 'keep-me-v2');
       const lstat = await fs.lstat(path.join(sandbox.globalPluginsDir, 'link-p'));
       assert.equal(lstat.isSymbolicLink(), true);
+      await assert.rejects(() => fs.stat(sandbox.configPath), { code: 'ENOENT' });
     } finally {
       await mcp.close();
       await sandbox.cleanup();
     }
   });
 
-  test('E2E-T2-F5-04: app_reinstall_plugin on plugin missing installMeta returns error without changing enabled', async () => {
+  test('E2E-T2-F5-03: app_reinstall_plugin on plugin missing installMeta returns error without touching config.json', async () => {
     const sandbox = await createSandbox();
     const mcp = spawnMcpClient({ dataDir: sandbox.dataDir, env: sandbox.env() });
     try {
       await sandbox.placeInstalledPlugin('global', 'manual-p');
-      await sandbox.writeConfig({ plugins: { 'manual-p': { enabled: true } } });
+      const initialCfg = JSON.stringify({ plugins: { 'manual-p': { enabled: true } } }, null, 2);
+      await sandbox.writeConfig(initialCfg);
       await mcp.initialize();
 
       const res = await mcp.callTool('app_reinstall_plugin', { dir: 'manual-p', scope: 'global' });
       assert.equal(res.structuredContent.ok, false);
       assert.match(res.structuredContent.error, /No saved source metadata/i);
-
-      const cfg = await sandbox.readConfig();
-      assert.equal(cfg.plugins['manual-p'].enabled, true);
+      assert.equal(await sandbox.readConfigRaw(), initialCfg);
     } finally {
       await mcp.close();
       await sandbox.cleanup();
     }
   });
 
-  test('E2E-T2-F5-05: app_install_plugin without overwrite on existing enabled locked plugin returns PLUGIN_EXISTS without disabling', async () => {
+  test('E2E-T2-F5-04: app_install_plugin without overwrite on existing plugin returns PLUGIN_EXISTS without touching files or config.json', async () => {
     const sandbox = await createSandbox();
     const mcp = spawnMcpClient({ dataDir: sandbox.dataDir, env: sandbox.env() });
-    let lock;
     try {
       const srcDir = await sandbox.createPluginSource('no-ow', {
         manifest: { name: 'no-ow', displayName: 'No OW', version: '1.0.0' },
       });
+      const initialCfg = JSON.stringify({ plugins: { 'no-ow': { enabled: true } } }, null, 2);
+      await sandbox.writeConfig(initialCfg);
       await mcp.initialize();
       await mcp.callTool('app_install_plugin', { source: srcDir });
-      await mcp.callTool('app_set_plugin_enabled', { dir: 'no-ow', scope: 'global', enabled: true });
-
-      const installedDir = path.join(sandbox.globalPluginsDir, 'no-ow');
-      lock = await spawnLockedPluginProcess({
-        pluginDir: installedDir,
-        configPath: sandbox.configPath,
-        dirName: 'no-ow',
-        releaseOnDisable: true,
-        releaseDelayMs: 50,
-      });
-      sandbox.trackChild(lock.child);
 
       const res = await mcp.callTool('app_install_plugin', {
         source: srcDir,
@@ -813,20 +573,15 @@ describe('Tier 2: Boundary, Error & Edge Cases (32 cases)', () => {
       });
       assert.equal(res.structuredContent.ok, false);
       assert.equal(res.structuredContent.code, 'PLUGIN_EXISTS');
-      assert.equal(lock.wasReleasedByConfigDisable(), false);
-      assert.equal(lock.isAlive(), true);
-
-      const cfg = await sandbox.readConfig();
-      assert.equal(cfg.plugins['no-ow'].enabled, true);
+      assert.equal(await sandbox.readConfigRaw(), initialCfg);
     } finally {
-      if (lock) await lock.forceKill();
       await mcp.close();
       await sandbox.cleanup();
     }
   });
 
   // =========================================================================
-  // F6: Self-Update Guard, Rollback & State Preservation (6 cases)
+  // F6: Self-Update Guard, Rollback & State Preservation (5 cases)
   // =========================================================================
 
   test('E2E-T2-F6-01: Self-update guard blocks overwriting live PLUGIN_ROOT (plugin-installer)', async () => {
@@ -856,15 +611,13 @@ describe('Tier 2: Boundary, Error & Edge Cases (32 cases)', () => {
         await fs.readFile(path.join(selfCopy.pluginDir, 'plugin.json'), 'utf8'),
       );
       assert.notEqual(pkgJson.version, '9.9.9');
-      const cfg = await sandbox.readConfig();
-      assert.equal(cfg.plugins['plugin-installer'].enabled, true);
     } finally {
       await mcp.close();
       await sandbox.cleanup();
     }
   });
 
-  test('E2E-T2-F6-02: Unreachable/failing HTTP 500 mock npm registry during app_reinstall_plugin preserves enabled: true', async () => {
+  test('E2E-T2-F6-02: Unreachable/failing HTTP 500 mock npm registry during app_reinstall_plugin preserves existing plugin & config.json', async () => {
     const sandbox = await createSandbox();
     const registry = await startMockNpmRegistry({
       packages: {
@@ -890,6 +643,8 @@ describe('Tier 2: Boundary, Error & Edge Cases (32 cases)', () => {
 
     const mcp = spawnMcpClient({ dataDir: sandbox.dataDir, env: sandbox.env() });
     try {
+      const initialCfg = JSON.stringify({ plugins: { 'e2e-npm-plugin': { enabled: true } } }, null, 2);
+      await sandbox.writeConfig(initialCfg);
       await mcp.initialize();
       const installRes = await mcp.callTool('app_install_plugin', {
         source: 'e2e-npm-plugin',
@@ -897,11 +652,6 @@ describe('Tier 2: Boundary, Error & Edge Cases (32 cases)', () => {
         registry: registry.url,
       });
       assert.equal(installRes.structuredContent.ok, true, installRes.structuredContent.error);
-      await mcp.callTool('app_set_plugin_enabled', {
-        dir: 'e2e-npm-plugin',
-        scope: 'global',
-        enabled: true,
-      });
 
       registry.setFailStatus(500);
       const reinstallRes = await mcp.callTool('app_reinstall_plugin', {
@@ -916,18 +666,16 @@ describe('Tier 2: Boundary, Error & Edge Cases (32 cases)', () => {
         'utf8',
       );
       assert.equal(marker, 'npm-v1');
-      const cfg = await sandbox.readConfig();
-      assert.equal(cfg.plugins['e2e-npm-plugin'].enabled, true);
+      assert.equal(await sandbox.readConfigRaw(), initialCfg);
     } finally {
       await mcp.close();
       await sandbox.cleanup();
     }
   });
 
-  test('E2E-T2-F6-03: Candidate missing plugin.json during overwrite fails before auto-disable', async () => {
+  test('E2E-T2-F6-03: Candidate missing plugin.json during overwrite fails without touching files or config.json', async () => {
     const sandbox = await createSandbox();
     const mcp = spawnMcpClient({ dataDir: sandbox.dataDir, env: sandbox.env() });
-    let lock;
     try {
       const v1Dir = await sandbox.createPluginSource('no-manifest-1', {
         manifest: { name: 'no-manifest', version: '1.0.0' },
@@ -937,24 +685,11 @@ describe('Tier 2: Boundary, Error & Edge Cases (32 cases)', () => {
         manifest: null,
         files: { 'readme.txt': 'missing plugin.json' },
       });
+      const initialCfg = JSON.stringify({ plugins: { 'no-manifest': { enabled: true } } }, null, 2);
+      await sandbox.writeConfig(initialCfg);
 
       await mcp.initialize();
       await mcp.callTool('app_install_plugin', { source: v1Dir });
-      await mcp.callTool('app_set_plugin_enabled', {
-        dir: 'no-manifest',
-        scope: 'global',
-        enabled: true,
-      });
-
-      const installedDir = path.join(sandbox.globalPluginsDir, 'no-manifest');
-      lock = await spawnLockedPluginProcess({
-        pluginDir: installedDir,
-        configPath: sandbox.configPath,
-        dirName: 'no-manifest',
-        releaseOnDisable: true,
-        releaseDelayMs: 50,
-      });
-      sandbox.trackChild(lock.child);
 
       const res = await mcp.callTool('app_install_plugin', {
         source: v2Missing,
@@ -963,57 +698,52 @@ describe('Tier 2: Boundary, Error & Edge Cases (32 cases)', () => {
       });
       assert.equal(res.structuredContent.ok, false);
       assert.match(res.structuredContent.error, /Missing plugin\.json/i);
-      assert.equal(lock.wasReleasedByConfigDisable(), false);
-      assert.equal(lock.isAlive(), true);
-
-      const cfg = await sandbox.readConfig();
-      assert.equal(cfg.plugins['no-manifest'].enabled, true);
+      assert.equal(await sandbox.readConfigRaw(), initialCfg);
     } finally {
-      if (lock) await lock.forceKill();
       await mcp.close();
       await sandbox.cleanup();
     }
   });
 
-  test('E2E-T2-F6-04: Uninstalling a disabled plugin preserves remaining plugins entries in config.json', async () => {
+  test('E2E-T2-F6-04: Uninstalling a disabled plugin preserves config.json byte-for-byte', async () => {
     const sandbox = await createSandbox();
     const mcp = spawnMcpClient({ dataDir: sandbox.dataDir, env: sandbox.env() });
     try {
       await sandbox.placeInstalledPlugin('global', 'p1');
       await sandbox.placeInstalledPlugin('global', 'p2');
-      await sandbox.writeConfig({
-        plugins: {
-          p1: { enabled: false },
-          p2: { enabled: true },
+      const initialCfg = JSON.stringify(
+        {
+          plugins: {
+            p1: { enabled: false },
+            p2: { enabled: true },
+          },
         },
-      });
+        null,
+        2,
+      );
+      await sandbox.writeConfig(initialCfg);
       await mcp.initialize();
 
       const res = await mcp.callTool('app_uninstall_plugin', { dir: 'p1', scope: 'global' });
       assert.equal(res.structuredContent.ok, true);
-
-      const cfg = await sandbox.readConfig();
-      assert.equal(cfg.plugins.p2.enabled, true);
+      assert.equal(await sandbox.readConfigRaw(), initialCfg);
     } finally {
       await mcp.close();
       await sandbox.cleanup();
     }
   });
 
-  test('E2E-T2-F6-05: Update changing manifest.version while keeping dir preserves enabled: false and updates installMeta', async () => {
+  test('E2E-T2-F6-05: Update changing manifest.version while keeping dir preserves disabled config.json state and updates installMeta', async () => {
     const sandbox = await createSandbox();
     const mcp = spawnMcpClient({ dataDir: sandbox.dataDir, env: sandbox.env() });
     try {
       const srcDir = await sandbox.createPluginSource('ver-bump', {
         manifest: { name: 'ver-bump', displayName: 'Ver Bump', version: '1.0.0' },
       });
+      const initialCfg = JSON.stringify({ plugins: { 'ver-bump': { enabled: false } } }, null, 2);
+      await sandbox.writeConfig(initialCfg);
       await mcp.initialize();
       await mcp.callTool('app_install_plugin', { source: srcDir });
-      await mcp.callTool('app_set_plugin_enabled', {
-        dir: 'ver-bump',
-        scope: 'global',
-        enabled: false,
-      });
 
       await sandbox.createPluginSource('ver-bump', {
         targetDir: srcDir,
@@ -1026,59 +756,11 @@ describe('Tier 2: Boundary, Error & Edge Cases (32 cases)', () => {
       assert.equal(p.version, '2.0.0');
       assert.equal(p.enabled, false);
       assert.equal(p.installMeta.version, '2.0.0');
+      assert.equal(await sandbox.readConfigRaw(), initialCfg);
 
       const reg = await sandbox.readInstallRegistry();
       assert.equal(reg.entries['global:ver-bump'].version, '2.0.0');
     } finally {
-      await mcp.close();
-      await sandbox.cleanup();
-    }
-  });
-
-  test('E2E-T2-F6-06: Update when config.json had NO entry for p1 auto-disables, releases lock, and restores enabled: true', async () => {
-    const sandbox = await createSandbox();
-    const mcp = spawnMcpClient({ dataDir: sandbox.dataDir, env: sandbox.env() });
-    let lock;
-    try {
-      const srcDir = await sandbox.createPluginSource('no-cfg-entry', {
-        manifest: { name: 'no-cfg-entry', displayName: 'No Cfg Entry', version: '1.0.0' },
-        files: { 'marker.txt': 'v1' },
-      });
-      await mcp.initialize();
-      await mcp.callTool('app_install_plugin', { source: srcDir });
-      // Confirm config.json does not even exist yet
-      await assert.rejects(() => fs.stat(sandbox.configPath), { code: 'ENOENT' });
-
-      const installedDir = path.join(sandbox.globalPluginsDir, 'no-cfg-entry');
-      lock = await spawnLockedPluginProcess({
-        pluginDir: installedDir,
-        configPath: sandbox.configPath,
-        dirName: 'no-cfg-entry',
-        releaseOnDisable: true,
-        releaseDelayMs: 150,
-      });
-      sandbox.trackChild(lock.child);
-
-      await sandbox.createPluginSource('no-cfg-entry', {
-        targetDir: srcDir,
-        manifest: { name: 'no-cfg-entry', displayName: 'No Cfg Entry', version: '2.0.0' },
-        files: { 'marker.txt': 'v2' },
-      });
-
-      const res = await mcp.callTool('app_reinstall_plugin', {
-        dir: 'no-cfg-entry',
-        scope: 'global',
-      });
-      assert.equal(res.structuredContent.ok, true, res.structuredContent.error);
-      await lock.waitForExit(5000);
-      assert.equal(lock.wasReleasedByConfigDisable(), true);
-
-      const marker = await fs.readFile(path.join(installedDir, 'marker.txt'), 'utf8');
-      assert.equal(marker, 'v2');
-      const cfg = await sandbox.readConfig();
-      assert.equal(cfg.plugins['no-cfg-entry'].enabled, true);
-    } finally {
-      if (lock) await lock.forceKill();
       await mcp.close();
       await sandbox.cleanup();
     }

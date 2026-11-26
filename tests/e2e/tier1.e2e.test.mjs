@@ -163,11 +163,15 @@ describe('Tier 1: Core Happy Paths & State Transitions (32 cases)', () => {
         'app_install_plugin',
         'app_uninstall_plugin',
         'app_reinstall_plugin',
-        'app_set_plugin_enabled',
       ]) {
         assert.ok(byName.has(appTool), `Missing app-only tool ${appTool}`);
         assert.deepEqual(byName.get(appTool)._meta?.ui?.visibility, ['app']);
       }
+      assert.equal(
+        byName.has('app_set_plugin_enabled'),
+        false,
+        'app_set_plugin_enabled must not be exposed because direct config.json edits bypass Language Server live reload',
+      );
     } finally {
       await mcp.close();
       await sandbox.cleanup();
@@ -344,134 +348,60 @@ describe('Tier 1: Core Happy Paths & State Transitions (32 cases)', () => {
   });
 
   // =========================================================================
-  // F3: R2.1 MCP app_set_plugin_enabled & config.json persistence (6 cases)
+  // F3: Read-only config.json parity & customization://<dir> contract (5 cases)
   // =========================================================================
 
-  test('E2E-T1-F3-01: app_set_plugin_enabled disables an enabled global plugin and persists to config.json', async () => {
+  test('E2E-T1-F3-01: app_list_plugins reads disabled global plugin state from config.json without mutating it', async () => {
     const sandbox = await createSandbox();
     const mcp = spawnMcpClient({ dataDir: sandbox.dataDir, env: sandbox.env() });
     try {
       await sandbox.placeInstalledPlugin('global', 'p1');
+      const rawCfg = JSON.stringify({ plugins: { p1: { enabled: false } } }, null, 2);
+      await sandbox.writeConfig(rawCfg);
       await mcp.initialize();
 
-      const res = await mcp.callTool('app_set_plugin_enabled', {
-        dir: 'p1',
-        scope: 'global',
-        enabled: false,
-      });
-      assert.equal(res.structuredContent.ok, true);
-      assert.equal(res.structuredContent.enabled, false);
-      const p1 = res.structuredContent.inventory.plugins.find((p) => p.dir === 'p1');
+      const res = await mcp.callTool('app_list_plugins', {});
+      const p1 = res.structuredContent.plugins.find((p) => p.dir === 'p1');
       assert.equal(p1.enabled, false);
-
-      const cfg = await sandbox.readConfig();
-      assert.equal(cfg.plugins.p1.enabled, false);
+      assert.equal(p1.customizationUri, 'customization://p1');
+      assert.equal(await sandbox.readConfigRaw(), rawCfg);
     } finally {
       await mcp.close();
       await sandbox.cleanup();
     }
   });
 
-  test('E2E-T1-F3-02: app_set_plugin_enabled enables a disabled global plugin', async () => {
-    const sandbox = await createSandbox();
-    const mcp = spawnMcpClient({ dataDir: sandbox.dataDir, env: sandbox.env() });
-    try {
-      await sandbox.placeInstalledPlugin('global', 'p1');
-      await sandbox.writeConfig({ plugins: { p1: { enabled: false } } });
-      await mcp.initialize();
-
-      const res = await mcp.callTool('app_set_plugin_enabled', {
-        dir: 'p1',
-        scope: 'global',
-        enabled: true,
-      });
-      assert.equal(res.structuredContent.ok, true);
-      assert.equal(res.structuredContent.enabled, true);
-      const p1 = res.structuredContent.inventory.plugins.find((p) => p.dir === 'p1');
-      assert.equal(p1.enabled, true);
-
-      const cfg = await sandbox.readConfig();
-      assert.equal(cfg.plugins.p1.enabled, true);
-    } finally {
-      await mcp.close();
-      await sandbox.cleanup();
-    }
-  });
-
-  test('E2E-T1-F3-03: app_set_plugin_enabled preserves unrelated keys in config.json', async () => {
-    const sandbox = await createSandbox();
-    const mcp = spawnMcpClient({ dataDir: sandbox.dataDir, env: sandbox.env() });
-    try {
-      await sandbox.placeInstalledPlugin('global', 'p1');
-      await sandbox.writeConfig({
-        userSettings: { theme: 'dark', fontSize: 14 },
-        sidecars: { keepAlive: true },
-        plugins: {
-          other: { enabled: true, customFlag: 'abc' },
-        },
-      });
-
-      await mcp.initialize();
-      const res = await mcp.callTool('app_set_plugin_enabled', {
-        dir: 'p1',
-        scope: 'global',
-        enabled: false,
-      });
-      assert.equal(res.structuredContent.ok, true);
-
-      const cfg = await sandbox.readConfig();
-      assert.deepEqual(cfg.userSettings, { theme: 'dark', fontSize: 14 });
-      assert.deepEqual(cfg.sidecars, { keepAlive: true });
-      assert.deepEqual(cfg.plugins.other, { enabled: true, customFlag: 'abc' });
-      assert.equal(cfg.plugins.p1.enabled, false);
-    } finally {
-      await mcp.close();
-      await sandbox.cleanup();
-    }
-  });
-
-  test('E2E-T1-F3-04: app_set_plugin_enabled works for workspace and built-in plugins', async () => {
+  test('E2E-T1-F3-02: app_list_plugins reads enabled/disabled states across workspace and built-in scopes', async () => {
     const sandbox = await createSandbox();
     const mcp = spawnMcpClient({ dataDir: sandbox.dataDir, env: sandbox.env() });
     try {
       await sandbox.placeInstalledPlugin('workspace', 'ws-p');
       await sandbox.placeInstalledPlugin('builtin', 'bi-p');
+      const rawCfg = JSON.stringify(
+        { plugins: { 'ws-p': { enabled: false }, 'bi-p': { enabled: false } } },
+        null,
+        2,
+      );
+      await sandbox.writeConfig(rawCfg);
       await mcp.initialize();
 
-      const r1 = await mcp.callTool('app_set_plugin_enabled', {
-        dir: 'ws-p',
-        scope: 'workspace',
+      const res = await mcp.callTool('app_list_plugins', {
         workspacePath: sandbox.workspaceDir,
-        enabled: false,
       });
-      assert.equal(r1.structuredContent.ok, true);
-      assert.equal(
-        r1.structuredContent.inventory.plugins.find((p) => p.id === 'workspace:ws-p').enabled,
-        false,
-      );
-
-      const r2 = await mcp.callTool('app_set_plugin_enabled', {
-        dir: 'bi-p',
-        scope: 'builtin',
-        workspacePath: sandbox.workspaceDir,
-        enabled: false,
-      });
-      assert.equal(r2.structuredContent.ok, true);
-      assert.equal(
-        r2.structuredContent.inventory.plugins.find((p) => p.id === 'builtin:bi-p').enabled,
-        false,
-      );
-
-      const cfg = await sandbox.readConfig();
-      assert.equal(cfg.plugins['ws-p'].enabled, false);
-      assert.equal(cfg.plugins['bi-p'].enabled, false);
+      const ws = res.structuredContent.plugins.find((p) => p.id === 'workspace:ws-p');
+      const bi = res.structuredContent.plugins.find((p) => p.id === 'builtin:bi-p');
+      assert.equal(ws.enabled, false);
+      assert.equal(ws.customizationUri, 'customization://ws-p');
+      assert.equal(bi.enabled, false);
+      assert.equal(bi.customizationUri, 'customization://bi-p');
+      assert.equal(await sandbox.readConfigRaw(), rawCfg);
     } finally {
       await mcp.close();
       await sandbox.cleanup();
     }
   });
 
-  test('E2E-T1-F3-05: app_set_plugin_enabled keys by dir when manifest.name !== dir and matches agy CLI', async () => {
+  test('E2E-T1-F3-03: app_list_plugins keys enablement & customizationUri by dir when manifest.name !== dir', async () => {
     const sandbox = await createSandbox();
     const mcp = spawnMcpClient({ dataDir: sandbox.dataDir, env: sandbox.env() });
     try {
@@ -482,18 +412,13 @@ describe('Tier 1: Core Happy Paths & State Transitions (32 cases)', () => {
           version: '1.0.0',
         },
       });
+      await sandbox.writeConfig({ plugins: { 'custom-dir': { enabled: false } } });
 
       await mcp.initialize();
-      const res = await mcp.callTool('app_set_plugin_enabled', {
-        dir: 'custom-dir',
-        scope: 'global',
-        enabled: false,
-      });
-      assert.equal(res.structuredContent.ok, true);
-
-      const cfg = await sandbox.readConfig();
-      assert.equal(cfg.plugins['custom-dir']?.enabled, false);
-      assert.equal(cfg.plugins['actual-name'], undefined);
+      const res = await mcp.callTool('app_list_plugins', {});
+      const plugin = res.structuredContent.plugins.find((p) => p.dir === 'custom-dir');
+      assert.equal(plugin.enabled, false);
+      assert.equal(plugin.customizationUri, 'customization://custom-dir');
 
       const agyList = await sandbox.runAgy(['plugin', 'list', '--json']);
       assert.equal(agyList.code, 0, agyList.stderr);
@@ -506,7 +431,7 @@ describe('Tier 1: Core Happy Paths & State Transitions (32 cases)', () => {
     }
   });
 
-  test('E2E-T1-F3-06: app_set_plugin_enabled honors custom ANTIGRAVITY_CONFIG_PATH', async () => {
+  test('E2E-T1-F3-04: app_list_plugins honors custom ANTIGRAVITY_CONFIG_PATH read-only', async () => {
     const sandbox = await createSandbox();
     const customConfigPath = path.join(sandbox.root, 'alt', 'my-config.json');
     const mcp = spawnMcpClient({
@@ -515,18 +440,12 @@ describe('Tier 1: Core Happy Paths & State Transitions (32 cases)', () => {
     });
     try {
       await sandbox.placeInstalledPlugin('global', 'p1');
+      await fs.mkdir(path.dirname(customConfigPath), { recursive: true });
+      await fs.writeFile(customConfigPath, JSON.stringify({ plugins: { p1: { enabled: false } } }), 'utf8');
       await mcp.initialize();
 
-      const res = await mcp.callTool('app_set_plugin_enabled', {
-        dir: 'p1',
-        scope: 'global',
-        enabled: false,
-      });
-      assert.equal(res.structuredContent.ok, true);
-
-      const altCfg = await sandbox.readConfig(customConfigPath);
-      assert.equal(altCfg.plugins.p1.enabled, false);
-
+      const res = await mcp.callTool('app_list_plugins', {});
+      assert.equal(res.structuredContent.plugins.find((p) => p.dir === 'p1').enabled, false);
       await assert.rejects(() => fs.stat(sandbox.configPath), { code: 'ENOENT' });
     } finally {
       await mcp.close();
@@ -535,10 +454,10 @@ describe('Tier 1: Core Happy Paths & State Transitions (32 cases)', () => {
   });
 
   // =========================================================================
-  // F4: R2.2 UI enable/disable toggle control & live state sync (5 cases)
+  // F4: UI read-only status, native Customizations guide & live sync (5 cases)
   // =========================================================================
 
-  test('E2E-T1-F4-01: Headless Edge renders plugin cards with accurate initial enabled/disabled toggle states', async () => {
+  test('E2E-T1-F4-01: Headless Edge renders accurate read-only status badges without broken toggle switches', async () => {
     const sandbox = await createSandbox();
     const mcp = spawnMcpClient({ dataDir: sandbox.dataDir, env: sandbox.env() });
     let session;
@@ -557,13 +476,13 @@ describe('Tier 1: Core Happy Paths & State Transitions (32 cases)', () => {
       const card2 = await session.getCardInfo('global:p-disabled');
 
       assert.equal(card1.exists, true);
-      assert.equal(card1.toggleExists, true);
-      assert.equal(card1.ariaChecked, 'true');
+      assert.equal(card1.toggleExists, false);
+      assert.equal(card1.manageBtnExists, true);
       assert.ok(card1.badges.some((b) => /Enabled|已启用/i.test(b)));
 
       assert.equal(card2.exists, true);
-      assert.equal(card2.toggleExists, true);
-      assert.equal(card2.ariaChecked, 'false');
+      assert.equal(card2.toggleExists, false);
+      assert.equal(card2.manageBtnExists, true);
       assert.ok(card2.badges.some((b) => /Disabled|已禁用/i.test(b)));
     } finally {
       if (session) await session.close();
@@ -572,7 +491,7 @@ describe('Tier 1: Core Happy Paths & State Transitions (32 cases)', () => {
     }
   });
 
-  test('E2E-T1-F4-02: Clicking toggle on enabled plugin card in headless Edge disables it end-to-end', async () => {
+  test('E2E-T1-F4-02: Native Customizations guide shows customization://<dir> and hides chat button in global view', async () => {
     const sandbox = await createSandbox();
     const mcp = spawnMcpClient({ dataDir: sandbox.dataDir, env: sandbox.env() });
     let session;
@@ -581,17 +500,19 @@ describe('Tier 1: Core Happy Paths & State Transitions (32 cases)', () => {
         manifest: { name: 'p1', displayName: 'Plugin One', version: '1.0.0' },
       });
       await mcp.initialize();
-      session = await browser.openAppSession({ mcpClient: mcp });
+      session = await browser.openAppSession({
+        mcpClient: mcp,
+        hostCapabilities: { serverTools: {}, openLinks: {} },
+      });
 
-      await session.clickCardToggle('global:p1');
-      await session.waitForToggleState('global:p1', false);
+      await session.click('.plugin-card[data-plugin-id="global:p1"] [data-action="toggle-manage-native"]');
+      await session.waitForSelector('.plugin-card[data-plugin-id="global:p1"] .native-guide-box');
 
       const card = await session.getCardInfo('global:p1');
-      assert.equal(card.ariaChecked, 'false');
-      assert.ok(card.badges.some((b) => /Disabled|已禁用/i.test(b)));
-
-      const cfg = await sandbox.readConfig();
-      assert.equal(cfg.plugins.p1.enabled, false);
+      assert.equal(card.nativeGuideExists, true);
+      assert.ok(card.nativeGuideText.includes('customization://p1'));
+      assert.equal(card.copyLinkBtnExists, true);
+      assert.equal(card.sendChatBtnExists, false);
     } finally {
       if (session) await session.close();
       await mcp.close();
@@ -599,7 +520,7 @@ describe('Tier 1: Core Happy Paths & State Transitions (32 cases)', () => {
     }
   });
 
-  test('E2E-T1-F4-03: Clicking toggle on disabled plugin card in headless Edge enables it end-to-end', async () => {
+  test('E2E-T1-F4-03: Aux-pane view with message capability sends customization://<dir> link to chat', async () => {
     const sandbox = await createSandbox();
     const mcp = spawnMcpClient({ dataDir: sandbox.dataDir, env: sandbox.env() });
     let session;
@@ -607,19 +528,20 @@ describe('Tier 1: Core Happy Paths & State Transitions (32 cases)', () => {
       await sandbox.placeInstalledPlugin('global', 'p2', {
         manifest: { name: 'p2', displayName: 'Plugin Two', version: '1.0.0' },
       });
-      await sandbox.writeConfig({ plugins: { p2: { enabled: false } } });
       await mcp.initialize();
-      session = await browser.openAppSession({ mcpClient: mcp });
+      session = await browser.openAppSession({
+        mcpClient: mcp,
+        hostCapabilities: { serverTools: {}, openLinks: {}, message: {} },
+      });
 
-      await session.clickCardToggle('global:p2');
-      await session.waitForToggleState('global:p2', true);
+      await session.click('.plugin-card[data-plugin-id="global:p2"] [data-action="toggle-manage-native"]');
+      await session.waitForSelector('.plugin-card[data-plugin-id="global:p2"] [data-action="send-native-link"]');
+      await session.click('.plugin-card[data-plugin-id="global:p2"] [data-action="send-native-link"]');
+      await session.waitForSelector('.toast');
 
-      const card = await session.getCardInfo('global:p2');
-      assert.equal(card.ariaChecked, 'true');
-      assert.ok(card.badges.some((b) => /Enabled|已启用/i.test(b)));
-
-      const cfg = await sandbox.readConfig();
-      assert.equal(cfg.plugins.p2.enabled, true);
+      const sent = await session.getSentMessages();
+      assert.equal(sent.length, 1);
+      assert.match(JSON.stringify(sent[0]), /customization:\/\/p2/);
     } finally {
       if (session) await session.close();
       await mcp.close();
@@ -639,13 +561,15 @@ describe('Tier 1: Core Happy Paths & State Transitions (32 cases)', () => {
       session = await browser.openAppSession({ mcpClient: mcp });
 
       const initialCard = await session.getCardInfo('global:p1');
-      assert.equal(initialCard.ariaChecked, 'true');
+      assert.ok(initialCard.badges.includes('Enabled'));
 
       const agyRes = await sandbox.runAgy(['plugin', 'disable', 'p1']);
       assert.equal(agyRes.code, 0, agyRes.stderr);
 
       await session.click('[data-action="refresh"]');
-      await session.waitForToggleState('global:p1', false);
+      await session.waitForText('Disabled');
+      const updatedCard = await session.getCardInfo('global:p1');
+      assert.ok(updatedCard.badges.includes('Disabled'));
     } finally {
       if (session) await session.close();
       await mcp.close();
@@ -653,7 +577,7 @@ describe('Tier 1: Core Happy Paths & State Transitions (32 cases)', () => {
     }
   });
 
-  test('E2E-T1-F4-05: Bilingual zh/en toggle renders localized enabled/disabled & update labels', async () => {
+  test('E2E-T1-F4-05: Bilingual zh/en toggle renders localized status, update & native management labels', async () => {
     const sandbox = await createSandbox();
     const mcp = spawnMcpClient({ dataDir: sandbox.dataDir, env: sandbox.env() });
     let session;
@@ -672,6 +596,7 @@ describe('Tier 1: Core Happy Paths & State Transitions (32 cases)', () => {
       const enCard = await session.getCardInfo('global:bilingual-p');
       assert.ok(enCard.badges.includes('Enabled'));
       assert.ok(enCard.text.includes('Update'));
+      assert.ok(enCard.text.includes('Enable / Disable'));
 
       await session.click('[data-action="toggle-locale"]');
       await session.waitForText('已启用');
@@ -679,10 +604,7 @@ describe('Tier 1: Core Happy Paths & State Transitions (32 cases)', () => {
       const zhCard = await session.getCardInfo('global:bilingual-p');
       assert.ok(zhCard.badges.includes('已启用'));
       assert.ok(zhCard.text.includes('更新'));
-      assert.ok(
-        /禁用|启用/.test(zhCard.toggleLabel),
-        `Expected Chinese localized toggle aria-label, got: "${zhCard.toggleLabel}"`,
-      );
+      assert.ok(zhCard.text.includes('原生启停'));
     } finally {
       if (session) await session.close();
       await mcp.close();
@@ -691,10 +613,10 @@ describe('Tier 1: Core Happy Paths & State Transitions (32 cases)', () => {
   });
 
   // =========================================================================
-  // F5: R3.1 Update auto-disable, OS lock release & restore (5 cases)
+  // F5: Atomic Update & File-Lock Safety without touching config.json (4 cases)
   // =========================================================================
 
-  test('E2E-T1-F5-01: app_reinstall_plugin on enabled plugin auto-disables, replaces files, and restores enabled: true', async () => {
+  test('E2E-T1-F5-01: app_reinstall_plugin replaces files cleanly without modifying config.json', async () => {
     const sandbox = await createSandbox();
     const mcp = spawnMcpClient({ dataDir: sandbox.dataDir, env: sandbox.env() });
     try {
@@ -702,6 +624,8 @@ describe('Tier 1: Core Happy Paths & State Transitions (32 cases)', () => {
         manifest: { name: 'upd-p', displayName: 'Upd P', version: '1.0.0' },
         files: { 'marker.txt': 'v1' },
       });
+      const initialCfg = JSON.stringify({ userSettings: { keep: 1 }, plugins: { 'upd-p': { enabled: true } } }, null, 2);
+      await sandbox.writeConfig(initialCfg);
       await mcp.initialize();
       await mcp.callTool('app_install_plugin', { source: srcDir });
 
@@ -713,22 +637,19 @@ describe('Tier 1: Core Happy Paths & State Transitions (32 cases)', () => {
 
       const res = await mcp.callTool('app_reinstall_plugin', { dir: 'upd-p', scope: 'global' });
       assert.equal(res.structuredContent.ok, true);
-      assert.equal(res.structuredContent.install.wasEnabled, true);
-      assert.equal(res.structuredContent.install.autoDisabled, true);
-      assert.equal(res.structuredContent.install.restoredEnabled, true);
+      assert.equal(res.structuredContent.install.overwrote, true);
       assert.equal(res.structuredContent.install.enabled, true);
 
       const marker = await fs.readFile(path.join(sandbox.globalPluginsDir, 'upd-p', 'marker.txt'), 'utf8');
       assert.equal(marker, 'v2');
-      const cfg = await sandbox.readConfig();
-      assert.equal(cfg.plugins['upd-p'].enabled, true);
+      assert.equal(await sandbox.readConfigRaw(), initialCfg);
     } finally {
       await mcp.close();
       await sandbox.cleanup();
     }
   });
 
-  test('E2E-T1-F5-02: app_reinstall_plugin on enabled plugin locked by real child process succeeds and restores enabled', async () => {
+  test('E2E-T1-F5-02: app_reinstall_plugin on locked plugin returns actionable customizationUri guidance without mutating files or config.json', async () => {
     const sandbox = await createSandbox();
     const mcp = spawnMcpClient({ dataDir: sandbox.dataDir, env: sandbox.env() });
     let lock;
@@ -737,17 +658,15 @@ describe('Tier 1: Core Happy Paths & State Transitions (32 cases)', () => {
         manifest: { name: 'locked-p', displayName: 'Locked P', version: '1.0.0' },
         files: { 'marker.txt': 'v1' },
       });
+      const initialCfg = JSON.stringify({ plugins: { 'locked-p': { enabled: true } } }, null, 2);
+      await sandbox.writeConfig(initialCfg);
       await mcp.initialize();
       await mcp.callTool('app_install_plugin', { source: srcDir });
-      await mcp.callTool('app_set_plugin_enabled', { dir: 'locked-p', scope: 'global', enabled: true });
 
       const installedDir = path.join(sandbox.globalPluginsDir, 'locked-p');
       lock = await spawnLockedPluginProcess({
         pluginDir: installedDir,
-        configPath: sandbox.configPath,
-        dirName: 'locked-p',
-        releaseOnDisable: true,
-        releaseDelayMs: 150,
+        releaseOnDisable: false,
       });
       sandbox.trackChild(lock.child);
 
@@ -757,15 +676,17 @@ describe('Tier 1: Core Happy Paths & State Transitions (32 cases)', () => {
         files: { 'marker.txt': 'v2' },
       });
 
-      const res = await mcp.callTool('app_reinstall_plugin', { dir: 'locked-p', scope: 'global' });
-      assert.equal(res.structuredContent.ok, true, `Reinstall failed: ${res.structuredContent.error}`);
-      await lock.waitForExit(5000);
-      assert.equal(lock.wasReleasedByConfigDisable(), true);
-
-      const marker = await fs.readFile(path.join(installedDir, 'marker.txt'), 'utf8');
-      assert.equal(marker, 'v2');
-      const cfg = await sandbox.readConfig();
-      assert.equal(cfg.plugins['locked-p'].enabled, true);
+      const res = await mcp.callTool(
+        'app_reinstall_plugin',
+        { dir: 'locked-p', scope: 'global' },
+        { timeoutMs: 15000 },
+      );
+      assert.equal(res.structuredContent.ok, false);
+      assert.equal(res.structuredContent.locked, true);
+      assert.equal(res.structuredContent.customizationUri, 'customization://locked-p');
+      assert.match(res.structuredContent.error, /customization:\/\/locked-p/);
+      assert.equal(await fs.readFile(path.join(installedDir, 'marker.txt'), 'utf8'), 'v1');
+      assert.equal(await sandbox.readConfigRaw(), initialCfg);
     } finally {
       if (lock) await lock.forceKill();
       await mcp.close();
@@ -773,55 +694,9 @@ describe('Tier 1: Core Happy Paths & State Transitions (32 cases)', () => {
     }
   });
 
-  test('E2E-T1-F5-03: app_install_plugin with overwrite: true on enabled locked plugin auto-disables and restores', async () => {
+  test('E2E-T1-F5-03: Model-visible install_plugin with overwrite: true replaces files cleanly without mutating config.json', async () => {
     const sandbox = await createSandbox();
     const mcp = spawnMcpClient({ dataDir: sandbox.dataDir, env: sandbox.env() });
-    let lock;
-    try {
-      const v1Dir = await sandbox.createPluginSource('ow-v1', {
-        manifest: { name: 'ow-plugin', displayName: 'OW Plugin', version: '1.0.0' },
-        files: { 'marker.txt': 'v1' },
-      });
-      const v2Dir = await sandbox.createPluginSource('ow-v2', {
-        manifest: { name: 'ow-plugin', displayName: 'OW Plugin', version: '2.0.0' },
-        files: { 'marker.txt': 'v2' },
-      });
-      await mcp.initialize();
-      await mcp.callTool('app_install_plugin', { source: v1Dir });
-
-      const installedDir = path.join(sandbox.globalPluginsDir, 'ow-plugin');
-      lock = await spawnLockedPluginProcess({
-        pluginDir: installedDir,
-        configPath: sandbox.configPath,
-        dirName: 'ow-plugin',
-        releaseOnDisable: true,
-        releaseDelayMs: 150,
-      });
-      sandbox.trackChild(lock.child);
-
-      const res = await mcp.callTool('app_install_plugin', {
-        source: v2Dir,
-        overwrite: true,
-      });
-      assert.equal(res.structuredContent.ok, true, res.structuredContent.error);
-      await lock.waitForExit(5000);
-      assert.equal(lock.wasReleasedByConfigDisable(), true);
-
-      const marker = await fs.readFile(path.join(installedDir, 'marker.txt'), 'utf8');
-      assert.equal(marker, 'v2');
-      const cfg = await sandbox.readConfig();
-      assert.equal(cfg.plugins['ow-plugin'].enabled, true);
-    } finally {
-      if (lock) await lock.forceKill();
-      await mcp.close();
-      await sandbox.cleanup();
-    }
-  });
-
-  test('E2E-T1-F5-04: Model-visible install_plugin with overwrite: true on enabled locked plugin succeeds & restores', async () => {
-    const sandbox = await createSandbox();
-    const mcp = spawnMcpClient({ dataDir: sandbox.dataDir, env: sandbox.env() });
-    let lock;
     try {
       const v1Dir = await sandbox.createPluginSource('model-v1', {
         manifest: { name: 'model-ow', displayName: 'Model OW', version: '1.0.0' },
@@ -831,44 +706,31 @@ describe('Tier 1: Core Happy Paths & State Transitions (32 cases)', () => {
         manifest: { name: 'model-ow', displayName: 'Model OW', version: '2.0.0' },
         files: { 'marker.txt': 'v2' },
       });
+      const initialCfg = JSON.stringify({ plugins: { 'model-ow': { enabled: true } } }, null, 2);
+      await sandbox.writeConfig(initialCfg);
       await mcp.initialize();
       await mcp.callTool('install_plugin', { source: v1Dir });
-
-      const installedDir = path.join(sandbox.globalPluginsDir, 'model-ow');
-      lock = await spawnLockedPluginProcess({
-        pluginDir: installedDir,
-        configPath: sandbox.configPath,
-        dirName: 'model-ow',
-        releaseOnDisable: true,
-        releaseDelayMs: 150,
-      });
-      sandbox.trackChild(lock.child);
 
       const res = await mcp.callTool('install_plugin', {
         source: v2Dir,
         overwrite: true,
       });
       assert.equal(res.isError, undefined);
-      assert.equal(res.structuredContent.lastInstall.wasEnabled, true);
-      assert.equal(res.structuredContent.lastInstall.restoredEnabled, true);
-      await lock.waitForExit(5000);
-      assert.equal(lock.wasReleasedByConfigDisable(), true);
+      assert.equal(res.structuredContent.lastInstall.overwrote, true);
+      assert.equal(res.structuredContent.lastInstall.plugin.customizationUri, 'customization://model-ow');
 
-      const marker = await fs.readFile(path.join(installedDir, 'marker.txt'), 'utf8');
+      const marker = await fs.readFile(path.join(sandbox.globalPluginsDir, 'model-ow', 'marker.txt'), 'utf8');
       assert.equal(marker, 'v2');
-      const cfg = await sandbox.readConfig();
-      assert.equal(cfg.plugins['model-ow'].enabled, true);
+      assert.equal(await sandbox.readConfigRaw(), initialCfg);
     } finally {
-      if (lock) await lock.forceKill();
       await mcp.close();
       await sandbox.cleanup();
     }
   });
 
-  test('E2E-T1-F5-05: Update of enabled workspace plugin auto-disables, releases lock, and restores enabled: true', async () => {
+  test('E2E-T1-F5-04: Update of workspace plugin replaces files cleanly without touching config.json', async () => {
     const sandbox = await createSandbox();
     const mcp = spawnMcpClient({ dataDir: sandbox.dataDir, env: sandbox.env() });
-    let lock;
     try {
       const srcDir = await sandbox.createPluginSource('ws-upd', {
         manifest: { name: 'ws-upd', displayName: 'WS Upd', version: '1.0.0' },
@@ -880,16 +742,6 @@ describe('Tier 1: Core Happy Paths & State Transitions (32 cases)', () => {
         scope: 'workspace',
         workspacePath: sandbox.workspaceDir,
       });
-
-      const installedDir = path.join(sandbox.workspacePluginsDir, 'ws-upd');
-      lock = await spawnLockedPluginProcess({
-        pluginDir: installedDir,
-        configPath: sandbox.configPath,
-        dirName: 'ws-upd',
-        releaseOnDisable: true,
-        releaseDelayMs: 150,
-      });
-      sandbox.trackChild(lock.child);
 
       await sandbox.createPluginSource('ws-upd', {
         targetDir: srcDir,
@@ -903,25 +755,20 @@ describe('Tier 1: Core Happy Paths & State Transitions (32 cases)', () => {
         workspacePath: sandbox.workspaceDir,
       });
       assert.equal(res.structuredContent.ok, true, res.structuredContent.error);
-      await lock.waitForExit(5000);
-      assert.equal(lock.wasReleasedByConfigDisable(), true);
-
-      const marker = await fs.readFile(path.join(installedDir, 'marker.txt'), 'utf8');
+      const marker = await fs.readFile(path.join(sandbox.workspacePluginsDir, 'ws-upd', 'marker.txt'), 'utf8');
       assert.equal(marker, 'v2');
-      const cfg = await sandbox.readConfig();
-      assert.equal(cfg.plugins['ws-upd'].enabled, true);
+      await assert.rejects(() => fs.stat(sandbox.configPath), { code: 'ENOENT' });
     } finally {
-      if (lock) await lock.forceKill();
       await mcp.close();
       await sandbox.cleanup();
     }
   });
 
   // =========================================================================
-  // F6: R3.2 Disabled-stay-disabled, rollback & self-update guard (5 cases)
+  // F6: Disabled state preservation & validation gates (4 cases)
   // =========================================================================
 
-  test('E2E-T1-F6-01: app_reinstall_plugin on disabled plugin keeps enabled: false after update', async () => {
+  test('E2E-T1-F6-01: app_reinstall_plugin on disabled plugin keeps enabled: false and config.json untouched', async () => {
     const sandbox = await createSandbox();
     const mcp = spawnMcpClient({ dataDir: sandbox.dataDir, env: sandbox.env() });
     try {
@@ -929,13 +776,10 @@ describe('Tier 1: Core Happy Paths & State Transitions (32 cases)', () => {
         manifest: { name: 'stay-dis', displayName: 'Stay Disabled', version: '1.0.0' },
         files: { 'marker.txt': 'v1' },
       });
+      const initialCfg = JSON.stringify({ plugins: { 'stay-dis': { enabled: false } } }, null, 2);
+      await sandbox.writeConfig(initialCfg);
       await mcp.initialize();
       await mcp.callTool('app_install_plugin', { source: srcDir });
-      await mcp.callTool('app_set_plugin_enabled', {
-        dir: 'stay-dis',
-        scope: 'global',
-        enabled: false,
-      });
 
       await sandbox.createPluginSource('stay-dis', {
         targetDir: srcDir,
@@ -945,13 +789,11 @@ describe('Tier 1: Core Happy Paths & State Transitions (32 cases)', () => {
 
       const res = await mcp.callTool('app_reinstall_plugin', { dir: 'stay-dis', scope: 'global' });
       assert.equal(res.structuredContent.ok, true);
-      assert.equal(res.structuredContent.install.wasEnabled, false);
       assert.equal(res.structuredContent.install.enabled, false);
 
       const p = res.structuredContent.inventory.plugins.find((x) => x.dir === 'stay-dis');
       assert.equal(p.enabled, false);
-      const cfg = await sandbox.readConfig();
-      assert.equal(cfg.plugins['stay-dis'].enabled, false);
+      assert.equal(await sandbox.readConfigRaw(), initialCfg);
       const marker = await fs.readFile(path.join(sandbox.globalPluginsDir, 'stay-dis', 'marker.txt'), 'utf8');
       assert.equal(marker, 'v2');
     } finally {
@@ -960,43 +802,7 @@ describe('Tier 1: Core Happy Paths & State Transitions (32 cases)', () => {
     }
   });
 
-  test('E2E-T1-F6-02: app_install_plugin overwrite: true on disabled plugin keeps enabled: false', async () => {
-    const sandbox = await createSandbox();
-    const mcp = spawnMcpClient({ dataDir: sandbox.dataDir, env: sandbox.env() });
-    try {
-      const v1Dir = await sandbox.createPluginSource('dis-ow-1', {
-        manifest: { name: 'dis-ow', displayName: 'Dis OW', version: '1.0.0' },
-        files: { 'marker.txt': 'v1' },
-      });
-      const v2Dir = await sandbox.createPluginSource('dis-ow-2', {
-        manifest: { name: 'dis-ow', displayName: 'Dis OW', version: '2.0.0' },
-        files: { 'marker.txt': 'v2' },
-      });
-      await mcp.initialize();
-      await mcp.callTool('app_install_plugin', { source: v1Dir });
-      await mcp.callTool('app_set_plugin_enabled', {
-        dir: 'dis-ow',
-        scope: 'global',
-        enabled: false,
-      });
-
-      const res = await mcp.callTool('app_install_plugin', {
-        source: v2Dir,
-        overwrite: true,
-      });
-      assert.equal(res.structuredContent.ok, true);
-      assert.equal(res.structuredContent.install.wasEnabled, false);
-      assert.equal(res.structuredContent.install.enabled, false);
-
-      const cfg = await sandbox.readConfig();
-      assert.equal(cfg.plugins['dis-ow'].enabled, false);
-    } finally {
-      await mcp.close();
-      await sandbox.cleanup();
-    }
-  });
-
-  test('E2E-T1-F6-03: Manifest disabled: true without config.json override treated as disabled and stays disabled after update', async () => {
+  test('E2E-T1-F6-02: Manifest disabled: true is respected read-only without creating config.json', async () => {
     const sandbox = await createSandbox();
     const mcp = spawnMcpClient({ dataDir: sandbox.dataDir, env: sandbox.env() });
     try {
@@ -1009,37 +815,22 @@ describe('Tier 1: Core Happy Paths & State Transitions (32 cases)', () => {
         },
         files: { 'marker.txt': 'v1' },
       });
-      const v2Dir = await sandbox.createPluginSource('man-dis-2', {
-        manifest: {
-          name: 'man-dis',
-          displayName: 'Man Dis',
-          version: '2.0.0',
-        },
-        files: { 'marker.txt': 'v2' },
-      });
 
       await mcp.initialize();
-      await mcp.callTool('app_install_plugin', { source: v1Dir });
-
-      const res = await mcp.callTool('app_install_plugin', {
-        source: v2Dir,
-        overwrite: true,
-      });
+      const res = await mcp.callTool('app_install_plugin', { source: v1Dir });
       assert.equal(res.structuredContent.ok, true);
-      assert.equal(res.structuredContent.install.wasEnabled, false);
       assert.equal(res.structuredContent.install.enabled, false);
 
       const plugin = res.structuredContent.inventory.plugins.find((p) => p.dir === 'man-dis');
       assert.equal(plugin.enabled, false);
-      const cfg = await sandbox.readConfig();
-      assert.equal(cfg?.plugins?.['man-dis']?.enabled, false);
+      await assert.rejects(() => fs.stat(sandbox.configPath), { code: 'ENOENT' });
     } finally {
       await mcp.close();
       await sandbox.cleanup();
     }
   });
 
-  test('E2E-T1-F6-04: Failed source fetch before deletion preserves enabled plugin files and enabled: true', async () => {
+  test('E2E-T1-F6-03: Failed source fetch before deletion preserves plugin files and config.json', async () => {
     const sandbox = await createSandbox();
     const mcp = spawnMcpClient({ dataDir: sandbox.dataDir, env: sandbox.env() });
     try {
@@ -1047,15 +838,11 @@ describe('Tier 1: Core Happy Paths & State Transitions (32 cases)', () => {
         manifest: { name: 'miss-src', displayName: 'Miss Src', version: '1.0.0' },
         files: { 'marker.txt': 'v1-intact' },
       });
+      const initialCfg = JSON.stringify({ plugins: { 'miss-src': { enabled: true } } }, null, 2);
+      await sandbox.writeConfig(initialCfg);
       await mcp.initialize();
       await mcp.callTool('app_install_plugin', { source: srcDir });
-      await mcp.callTool('app_set_plugin_enabled', {
-        dir: 'miss-src',
-        scope: 'global',
-        enabled: true,
-      });
 
-      // Remove source dir so reinstall fetch fails
       await fs.rm(srcDir, { recursive: true, force: true });
 
       const res = await mcp.callTool('app_reinstall_plugin', { dir: 'miss-src', scope: 'global' });
@@ -1063,15 +850,14 @@ describe('Tier 1: Core Happy Paths & State Transitions (32 cases)', () => {
 
       const marker = await fs.readFile(path.join(sandbox.globalPluginsDir, 'miss-src', 'marker.txt'), 'utf8');
       assert.equal(marker, 'v1-intact');
-      const cfg = await sandbox.readConfig();
-      assert.equal(cfg.plugins['miss-src'].enabled, true);
+      assert.equal(await sandbox.readConfigRaw(), initialCfg);
     } finally {
       await mcp.close();
       await sandbox.cleanup();
     }
   });
 
-  test('E2E-T1-F6-05: Failed candidate manifest validation during staging preserves enabled plugin & enabled: true', async () => {
+  test('E2E-T1-F6-04: Failed candidate manifest validation during staging preserves plugin files and config.json', async () => {
     const sandbox = await createSandbox();
     const mcp = spawnMcpClient({ dataDir: sandbox.dataDir, env: sandbox.env() });
     try {
@@ -1082,13 +868,10 @@ describe('Tier 1: Core Happy Paths & State Transitions (32 cases)', () => {
       const badV2Dir = await sandbox.createPluginSource('bad-cand-2', {
         rawManifest: '{ "name": "Bad_Name", broken json',
       });
+      const initialCfg = JSON.stringify({ plugins: { 'bad-cand': { enabled: true } } }, null, 2);
+      await sandbox.writeConfig(initialCfg);
       await mcp.initialize();
       await mcp.callTool('app_install_plugin', { source: v1Dir });
-      await mcp.callTool('app_set_plugin_enabled', {
-        dir: 'bad-cand',
-        scope: 'global',
-        enabled: true,
-      });
 
       const res = await mcp.callTool('app_install_plugin', {
         source: badV2Dir,
@@ -1099,8 +882,7 @@ describe('Tier 1: Core Happy Paths & State Transitions (32 cases)', () => {
 
       const marker = await fs.readFile(path.join(sandbox.globalPluginsDir, 'bad-cand', 'marker.txt'), 'utf8');
       assert.equal(marker, 'v1-intact');
-      const cfg = await sandbox.readConfig();
-      assert.equal(cfg.plugins['bad-cand'].enabled, true);
+      assert.equal(await sandbox.readConfigRaw(), initialCfg);
     } finally {
       await mcp.close();
       await sandbox.cleanup();

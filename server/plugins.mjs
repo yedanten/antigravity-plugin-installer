@@ -5,6 +5,7 @@ import path from 'node:path';
 import { parseJsonc, validatePluginDir } from './validator.mjs';
 
 const MAX_LOGO_BYTES = 256 * 1024;
+const RENAME_RETRY_CODES = new Set(['EBUSY', 'EPERM', 'EACCES']);
 const MIME_BY_EXT = {
   '.svg': 'image/svg+xml',
   '.png': 'image/png',
@@ -13,12 +14,26 @@ const MIME_BY_EXT = {
   '.webp': 'image/webp',
 };
 
-let configWriteQueue = Promise.resolve();
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
-function runSerializedConfigWrite(task) {
-  const next = configWriteQueue.then(task, task);
-  configWriteQueue = next.catch(() => {});
-  return next;
+export async function renameWithRetry(fromPath, toPath, { retries = 4, delayMs = 80 } = {}) {
+  const maxAttempts = Math.max(1, Number(retries) + 1);
+  const waitMs = Math.max(0, Number(delayMs) || 0);
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      await fs.rename(fromPath, toPath);
+      return;
+    } catch (err) {
+      const code = err && typeof err === 'object' ? err.code : '';
+      if (RENAME_RETRY_CODES.has(code) && attempt < maxAttempts) {
+        if (waitMs > 0) await sleep(waitMs);
+        continue;
+      }
+      throw err;
+    }
+  }
 }
 
 export function getGlobalPluginsDir() {
@@ -179,70 +194,6 @@ export function validatePluginDirName(dirName) {
   }
 }
 
-export async function setPluginEnabled(dirName, enabled) {
-  validatePluginDirName(dirName);
-  const nextEnabled = Boolean(enabled);
-
-  return runSerializedConfigWrite(async () => {
-    const configPath = getConfigPath();
-    const config = await readAntigravityConfig();
-
-    const existingPlugins =
-      config.plugins && typeof config.plugins === 'object' && !Array.isArray(config.plugins)
-        ? { ...config.plugins }
-        : {};
-
-    const previousEntry =
-      Object.hasOwn(existingPlugins, dirName) &&
-      existingPlugins[dirName] &&
-      typeof existingPlugins[dirName] === 'object' &&
-      !Array.isArray(existingPlugins[dirName])
-        ? { ...existingPlugins[dirName] }
-        : {};
-
-    const previousEnabled =
-      typeof previousEntry.enabled === 'boolean' ? previousEntry.enabled : undefined;
-
-    existingPlugins[dirName] = {
-      ...previousEntry,
-      enabled: nextEnabled,
-    };
-
-    const nextConfig = {
-      ...config,
-      plugins: existingPlugins,
-    };
-
-    const configDir = path.dirname(configPath);
-    await fs.mkdir(configDir, { recursive: true });
-    const tmpPath = path.join(
-      configDir,
-      `.${path.basename(configPath)}.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2)}.tmp`,
-    );
-
-    try {
-      await fs.writeFile(tmpPath, `${JSON.stringify(nextConfig, null, 2)}\n`, {
-        encoding: 'utf8',
-        mode: 0o600,
-      });
-      if (process.platform !== 'win32') {
-        await fs.chmod(tmpPath, 0o600).catch(() => {});
-      }
-      await fs.rename(tmpPath, configPath);
-    } catch (err) {
-      await fs.rm(tmpPath, { force: true }).catch(() => {});
-      throw err;
-    }
-
-    return {
-      dir: dirName,
-      enabled: nextEnabled,
-      previousEnabled,
-      configPath,
-    };
-  });
-}
-
 export class InstallRegistry {
   constructor(dataDir) {
     this.dataDir = dataDir ? path.resolve(dataDir) : path.join(os.homedir(), '.gemini', 'antigravity', 'plugin-installer-data');
@@ -275,7 +226,7 @@ export class InstallRegistry {
       JSON.stringify({ version: 1, entries }, null, 2),
       'utf8',
     );
-    await fs.rename(tmpPath, this.filePath);
+    await renameWithRetry(tmpPath, this.filePath);
   }
 
   async remove(key) {
@@ -289,7 +240,7 @@ export class InstallRegistry {
       JSON.stringify({ version: 1, entries }, null, 2),
       'utf8',
     );
-    await fs.rename(tmpPath, this.filePath);
+    await renameWithRetry(tmpPath, this.filePath);
   }
 }
 
@@ -376,6 +327,7 @@ async function scanPluginsRoot(rootDir, scope, overrides, registryEntries, works
     results.push({
       id: `${scope}:${entry.name}`,
       dir: entry.name,
+      customizationUri: `customization://${entry.name}`,
       name: manifest.name || entry.name,
       displayName: manifest.displayName || manifest.name || entry.name,
       description: manifest.description || '',

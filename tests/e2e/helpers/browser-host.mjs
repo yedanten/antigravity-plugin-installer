@@ -92,8 +92,11 @@ async function connectCdpWebSocket(wsUrl) {
   return { ws, send, close };
 }
 
-function buildHostPageHtml(initialHostContext) {
+function buildHostPageHtml(initialHostContext, initialHostCapabilities) {
   const ctxJson = JSON.stringify(initialHostContext || { theme: 'light', locale: 'en-US' });
+  const capsJson = JSON.stringify(
+    initialHostCapabilities || { serverTools: {}, openLinks: {} },
+  );
   return `<!doctype html>
 <html>
 <head>
@@ -109,8 +112,10 @@ function buildHostPageHtml(initialHostContext) {
   <script>
     window.__mcpHostReady = false;
     window.__hostContext = ${ctxJson};
+    window.__hostCapabilities = ${capsJson};
     window.__pendingToolResult = null;
     window.__toolCalls = [];
+    window.__sentMessages = [];
 
     const frame = document.getElementById('app-frame');
 
@@ -146,8 +151,8 @@ function buildHostPageHtml(initialHostContext) {
           id: msg.id,
           result: {
             protocolVersion: (msg.params && msg.params.protocolVersion) || '2026-01-26',
-            hostInfo: { name: 'antigravity-e2e-host', version: '2.35.1' },
-            hostCapabilities: { serverTools: {}, openLinks: {} },
+            hostInfo: { name: 'antigravity-e2e-host', version: '2.35.2' },
+            hostCapabilities: window.__hostCapabilities,
             hostContext: window.__hostContext
           }
         }, '*');
@@ -161,6 +166,16 @@ function buildHostPageHtml(initialHostContext) {
           window.__pendingToolResult = null;
           window.__sendToolResult(pending);
         }
+        return;
+      }
+
+      if (msg.method === 'ui/message') {
+        window.__sentMessages.push(msg.params || {});
+        frame.contentWindow.postMessage({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: {}
+        }, '*');
         return;
       }
 
@@ -212,13 +227,18 @@ function buildHostPageHtml(initialHostContext) {
 
 async function createMcpAppHostServer(
   mcpClient,
-  { hostContext = { theme: 'light', locale: 'en-US' }, toolDelayMs = 0, toolDelayFor = null } = {},
+  {
+    hostContext = { theme: 'light', locale: 'en-US' },
+    hostCapabilities = { serverTools: {}, openLinks: {} },
+    toolDelayMs = 0,
+    toolDelayFor = null,
+  } = {},
 ) {
   const server = http.createServer(async (req, res) => {
     try {
       const reqUrl = new URL(req.url || '/', 'http://127.0.0.1');
       if (req.method === 'GET' && reqUrl.pathname === '/') {
-        const html = buildHostPageHtml(hostContext);
+        const html = buildHostPageHtml(hostContext, hostCapabilities);
         res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
         res.end(html);
         return;
@@ -342,6 +362,7 @@ export async function launchHeadlessBrowser() {
   async function openAppSession({
     mcpClient,
     hostContext = { theme: 'light', locale: 'en-US' },
+    hostCapabilities = { serverTools: {}, openLinks: {} },
     viewport = { width: 1200, height: 800 },
     toolDelayMs = 0,
     toolDelayFor = null,
@@ -349,6 +370,7 @@ export async function launchHeadlessBrowser() {
   }) {
     const hostServer = await createMcpAppHostServer(mcpClient, {
       hostContext,
+      hostCapabilities,
       toolDelayMs,
       toolDelayFor,
     });
@@ -557,6 +579,10 @@ export async function launchHeadlessBrowser() {
       return evalTop(() => window.__toolCalls || []);
     }
 
+    async function getSentMessages() {
+      return evalTop(() => window.__sentMessages || []);
+    }
+
     async function getCardInfo(pluginId) {
       return evalInApp((doc, win, id) => {
         const card = doc.querySelector(`.plugin-card[data-plugin-id="${CSS.escape(id)}"]`);
@@ -565,99 +591,45 @@ export async function launchHeadlessBrowser() {
         const toggle =
           card.querySelector('button[role="switch"]') ||
           card.querySelector('[role="switch"]') ||
-          card.querySelector('[aria-checked]') ||
-          card.querySelector('[data-action*="toggle"]:not([data-action="toggle-details"])') ||
-          card.querySelector('[data-action*="enable"], [data-action*="disable"]');
+          card.querySelector('[aria-checked]');
+
+        const manageBtn = card.querySelector('[data-action="toggle-manage-native"]');
+        const nativeGuide = card.querySelector('.native-guide-box');
+        const copyLinkBtn = card.querySelector('[data-action="copy-native-link"]');
+        const sendChatBtn = card.querySelector('[data-action="send-native-link"]');
 
         const badges = Array.from(card.querySelectorAll('.badge')).map((b) =>
           (b.textContent || '').trim(),
         );
         const reinstallBtn = card.querySelector('[data-action="reinstall"]');
-        const toggleRect = toggle ? toggle.getBoundingClientRect() : null;
-
-        let ariaChecked = null;
-        if (toggle) {
-          if (toggle.hasAttribute('aria-checked')) {
-            ariaChecked = toggle.getAttribute('aria-checked');
-          } else if (typeof toggle.checked === 'boolean') {
-            ariaChecked = String(toggle.checked);
-          }
-        }
+        const manageRect = manageBtn ? manageBtn.getBoundingClientRect() : null;
 
         return {
           exists: true,
           text: card.innerText || '',
           badges,
           toggleExists: Boolean(toggle),
-          ariaChecked,
-          toggleDisabled: toggle
-            ? Boolean(toggle.disabled || toggle.getAttribute('aria-disabled') === 'true')
-            : false,
-          toggleLabel: toggle
-            ? (toggle.getAttribute('aria-label') || toggle.getAttribute('title') || toggle.textContent || '').trim()
-            : '',
-          toggleRect: toggleRect
+          manageBtnExists: Boolean(manageBtn),
+          manageBtnRect: manageRect
             ? {
-                left: toggleRect.left,
-                right: toggleRect.right,
-                top: toggleRect.top,
-                bottom: toggleRect.bottom,
-                width: toggleRect.width,
-                height: toggleRect.height,
+                left: manageRect.left,
+                right: manageRect.right,
+                top: manageRect.top,
+                bottom: manageRect.bottom,
+                width: manageRect.width,
+                height: manageRect.height,
               }
             : null,
+          nativeGuideExists: Boolean(nativeGuide),
+          nativeGuideText: nativeGuide ? nativeGuide.innerText || '' : '',
+          copyLinkBtnExists: Boolean(copyLinkBtn),
+          sendChatBtnExists: Boolean(sendChatBtn),
           reinstallExists: Boolean(reinstallBtn),
           reinstallDisabled: reinstallBtn ? Boolean(reinstallBtn.disabled) : false,
           viewportWidth: win.innerWidth,
           scrollWidth: doc.documentElement.scrollWidth,
         };
       }, pluginId);
-    }
-
-    async function clickCardToggle(pluginId) {
-      const ok = await evalInApp((doc, _win, id) => {
-        const card = doc.querySelector(`.plugin-card[data-plugin-id="${CSS.escape(id)}"]`);
-        if (!card) return false;
-        const toggle =
-          card.querySelector('button[role="switch"]') ||
-          card.querySelector('[role="switch"]') ||
-          card.querySelector('[aria-checked]') ||
-          card.querySelector('[data-action*="toggle"]:not([data-action="toggle-details"])') ||
-          card.querySelector('[data-action*="enable"], [data-action*="disable"]');
-        if (!toggle) return false;
-        toggle.scrollIntoView({ block: 'center', inline: 'center' });
-        toggle.click();
-        return true;
-      }, pluginId);
-      if (!ok) {
-        throw new Error(`No enable/disable toggle control found on card "${pluginId}"`);
-      }
-    }
-
-    async function waitForToggleState(pluginId, expectedEnabled, opts = {}) {
-      const expectedStr = String(Boolean(expectedEnabled));
-      return waitFor(
-        (doc, _win, id, exp) => {
-          const card = doc.querySelector(`.plugin-card[data-plugin-id="${CSS.escape(id)}"]`);
-          if (!card) return false;
-          const toggle =
-            card.querySelector('button[role="switch"]') ||
-            card.querySelector('[role="switch"]') ||
-            card.querySelector('[aria-checked]') ||
-            card.querySelector('[data-action*="toggle"]:not([data-action="toggle-details"])') ||
-            card.querySelector('[data-action*="enable"], [data-action*="disable"]');
-          if (!toggle) return false;
-          if (toggle.hasAttribute('aria-checked')) {
-            return toggle.getAttribute('aria-checked') === exp;
-          }
-          if (typeof toggle.checked === 'boolean') {
-            return String(toggle.checked) === exp;
-          }
-          return false;
-        },
-        [pluginId, expectedStr],
-        { ...opts, label: `${pluginId} toggle=${expectedStr}` },
-      );
     }
 
     async function close() {
@@ -681,10 +653,9 @@ export async function launchHeadlessBrowser() {
       sendToolResult,
       setViewport,
       getToolCalls,
+      getSentMessages,
       getAppText,
       getCardInfo,
-      clickCardToggle,
-      waitForToggleState,
       close,
     };
   }

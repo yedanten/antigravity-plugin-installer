@@ -32,7 +32,7 @@ describe('Tier 4: Real-World End-to-End Application Scenarios (6 cases)', () => 
     if (browser) await browser.close();
   });
 
-  test('E2E-T4-01: Full UI Install -> agy CLI Parity -> OS Child Lock -> UI Update -> Auto-Disable & Restore', async () => {
+  test('E2E-T4-01: Full UI Install -> agy Parity -> Locked Update Guidance -> Stop Process -> UI Update Succeeds', async () => {
     const sandbox = await createSandbox();
     const mcp = spawnMcpClient({ dataDir: sandbox.dataDir, env: sandbox.env() });
     let session;
@@ -53,7 +53,6 @@ describe('Tier 4: Real-World End-to-End Application Scenarios (6 cases)', () => 
       await session.click('#modal-submit-btn');
       await session.waitForSelector('.alert-success', { timeoutMs: 12000 });
       await session.click('.modal-footer-row [data-action="close-modal"]');
-
       await session.waitForSelector('.plugin-card[data-plugin-id="global:journey-one"]');
 
       // Verify agy strict validation and agy list parity
@@ -67,23 +66,30 @@ describe('Tier 4: Real-World End-to-End Application Scenarios (6 cases)', () => 
       assert.ok(entry1);
       assert.equal(entry1.enabled, true);
 
-      // Lock the installed plugin directory with a real OS child process
+      // Lock the installed plugin directory (simulating a running MCP server / sidecar)
       lock = await spawnLockedPluginProcess({
         pluginDir: installedDir,
-        configPath: sandbox.configPath,
-        dirName: 'journey-one',
-        releaseOnDisable: true,
-        releaseDelayMs: 150,
+        releaseOnDisable: false,
       });
       sandbox.trackChild(lock.child);
 
-      // Bump source to v2.0.0 and click Update in UI
+      // Bump source to v2.0.0 and click Update in UI -> should fail safely with native Customizations guide
       await sandbox.createPluginSource('journey-one', {
         targetDir: srcDir,
         manifest: { name: 'journey-one', displayName: 'Journey One', version: '2.0.0' },
         rules: { 'AGENTS.md': '# Clean rule v2\n' },
         files: { 'marker.txt': 'v2' },
       });
+
+      await session.click('.plugin-card[data-plugin-id="global:journey-one"] [data-action="reinstall"]');
+      await session.waitForSelector('.toast.error', { timeoutMs: 15000 });
+      await session.waitForSelector('.plugin-card[data-plugin-id="global:journey-one"] .native-guide-box');
+      assert.equal(await fs.readFile(path.join(installedDir, 'marker.txt'), 'utf8'), 'v1');
+      await assert.rejects(() => fs.stat(sandbox.configPath), { code: 'ENOENT' });
+
+      // Simulate user stopping/disabling the plugin in native Customizations -> retry Update succeeds
+      await lock.forceKill();
+      lock = null;
 
       await session.click('.plugin-card[data-plugin-id="global:journey-one"] [data-action="reinstall"]');
       await session.waitFor(
@@ -95,18 +101,8 @@ describe('Tier 4: Real-World End-to-End Application Scenarios (6 cases)', () => 
         { timeoutMs: 15000, label: 'journey-one updated to v2.0.0 in UI' },
       );
 
-      await lock.waitForExit(5000);
-      assert.equal(lock.wasReleasedByConfigDisable(), true);
-
       assert.equal(await fs.readFile(path.join(installedDir, 'marker.txt'), 'utf8'), 'v2');
-      const card = await session.getCardInfo('global:journey-one');
-      assert.equal(card.ariaChecked, 'true');
-
-      const cfg = await sandbox.readConfig();
-      assert.equal(cfg.plugins['journey-one'].enabled, true);
-
-      const listRes2 = await sandbox.runAgy(['plugin', 'list', '--json']);
-      assert.equal(extractAgyPluginEntry(listRes2.stdout, 'journey-one').enabled, true);
+      await assert.rejects(() => fs.stat(sandbox.configPath), { code: 'ENOENT' });
     } finally {
       if (lock) await lock.forceKill();
       if (session) await session.close();
@@ -115,7 +111,7 @@ describe('Tier 4: Real-World End-to-End Application Scenarios (6 cases)', () => 
     }
   });
 
-  test('E2E-T4-02: UI Disable -> agy Verification -> UI Update Disabled -> Re-enable in UI', async () => {
+  test('E2E-T4-02: External agy Disable -> UI Refresh -> UI Update Preserves Disabled -> External Re-enable -> UI Refresh', async () => {
     const sandbox = await createSandbox();
     const mcp = spawnMcpClient({ dataDir: sandbox.dataDir, env: sandbox.env() });
     let session;
@@ -128,11 +124,12 @@ describe('Tier 4: Real-World End-to-End Application Scenarios (6 cases)', () => 
       await mcp.callTool('app_install_plugin', { source: srcDir });
 
       session = await browser.openAppSession({ mcpClient: mcp });
-      await session.clickCardToggle('global:journey-two');
-      await session.waitForToggleState('global:journey-two', false);
 
-      const agy1 = await sandbox.runAgy(['plugin', 'list', '--json']);
-      assert.equal(extractAgyPluginEntry(agy1.stdout, 'journey-two').enabled, false);
+      // External disable via agy CLI (simulating native state change)
+      assert.equal((await sandbox.runAgy(['plugin', 'disable', 'journey-two'])).code, 0);
+      await session.click('[data-action="refresh"]');
+      await session.waitForText('Disabled');
+      const cfgAfterDis = await sandbox.readConfigRaw();
 
       await sandbox.createPluginSource('journey-two', {
         targetDir: srcDir,
@@ -151,15 +148,13 @@ describe('Tier 4: Real-World End-to-End Application Scenarios (6 cases)', () => 
       );
 
       const afterUpdateCard = await session.getCardInfo('global:journey-two');
-      assert.equal(afterUpdateCard.ariaChecked, 'false');
-      const agy2 = await sandbox.runAgy(['plugin', 'list', '--json']);
-      assert.equal(extractAgyPluginEntry(agy2.stdout, 'journey-two').enabled, false);
+      assert.ok(afterUpdateCard.badges.includes('Disabled'));
+      assert.equal(await sandbox.readConfigRaw(), cfgAfterDis);
 
-      await session.clickCardToggle('global:journey-two');
-      await session.waitForToggleState('global:journey-two', true);
-
-      const agy3 = await sandbox.runAgy(['plugin', 'list', '--json']);
-      assert.equal(extractAgyPluginEntry(agy3.stdout, 'journey-two').enabled, true);
+      // External re-enable & UI refresh
+      assert.equal((await sandbox.runAgy(['plugin', 'enable', 'journey-two'])).code, 0);
+      await session.click('[data-action="refresh"]');
+      await session.waitForText('Enabled');
     } finally {
       if (session) await session.close();
       await mcp.close();
@@ -167,14 +162,13 @@ describe('Tier 4: Real-World End-to-End Application Scenarios (6 cases)', () => 
     }
   });
 
-  test('E2E-T4-03: Multi-Scope (builtin + global name!==dir + workspace BOM) Management + userSettings/sidecars Preservation', async () => {
+  test('E2E-T4-03: Multi-Scope (builtin + global name!==dir + workspace BOM) Management + Untouched userSettings/sidecars', async () => {
     const sandbox = await createSandbox();
     const mcp = spawnMcpClient({
       dataDir: sandbox.dataDir,
       env: sandbox.env({}, { omitBuiltinPluginsDir: true }),
     });
     let session;
-    let lock;
     try {
       await sandbox.placeInstalledPlugin('builtin', 'core-bi', {
         manifest: { name: 'core-bi', displayName: 'Core Builtin', version: '1.0.0' },
@@ -188,11 +182,16 @@ describe('Tier 4: Real-World End-to-End Application Scenarios (6 cases)', () => 
         files: { 'marker.txt': 'ws-v1' },
       });
 
-      await sandbox.writeConfig({
-        userSettings: { editorFont: 'JetBrains Mono' },
-        sidecars: { autoStart: true },
-        plugins: {},
-      });
+      const initialCfg = JSON.stringify(
+        {
+          userSettings: { editorFont: 'JetBrains Mono' },
+          sidecars: { autoStart: true },
+          plugins: { 'alias-folder': { enabled: false } },
+        },
+        null,
+        2,
+      );
+      await sandbox.writeConfig(initialCfg);
 
       await mcp.initialize();
       await mcp.callTool('app_install_plugin', {
@@ -207,20 +206,8 @@ describe('Tier 4: Real-World End-to-End Application Scenarios (6 cases)', () => 
       await session.click('[data-action="apply-workspace"]');
       await session.waitForSelector('.plugin-card[data-plugin-id="workspace:ws-bom"]');
 
-      // Disable aliased global plugin
-      await session.clickCardToggle('global:alias-folder');
-      await session.waitForToggleState('global:alias-folder', false);
-
-      // Lock workspace plugin & update it via UI
-      const wsInstalledDir = path.join(sandbox.workspacePluginsDir, 'ws-bom');
-      lock = await spawnLockedPluginProcess({
-        pluginDir: wsInstalledDir,
-        configPath: sandbox.configPath,
-        dirName: 'ws-bom',
-        releaseOnDisable: true,
-        releaseDelayMs: 150,
-      });
-      sandbox.trackChild(lock.child);
+      const aliasCard = await session.getCardInfo('global:alias-folder');
+      assert.ok(aliasCard.badges.includes('Disabled'));
 
       await sandbox.createPluginSource('ws-bom-src', {
         targetDir: wsSrc,
@@ -240,56 +227,39 @@ describe('Tier 4: Real-World End-to-End Application Scenarios (6 cases)', () => 
         { timeoutMs: 15000, label: 'ws-bom updated to v2.0.0' },
       );
 
-      await lock.waitForExit(5000);
-      assert.equal(lock.wasReleasedByConfigDisable(), true);
-      assert.equal(await fs.readFile(path.join(wsInstalledDir, 'marker.txt'), 'utf8'), 'ws-v2');
-
-      const cfg = await sandbox.readConfig();
-      assert.deepEqual(cfg.userSettings, { editorFont: 'JetBrains Mono' });
-      assert.deepEqual(cfg.sidecars, { autoStart: true });
-      assert.equal(cfg.plugins['alias-folder'].enabled, false);
-      assert.equal(cfg.plugins['ws-bom'].enabled, true);
+      assert.equal(
+        await fs.readFile(path.join(sandbox.workspacePluginsDir, 'ws-bom', 'marker.txt'), 'utf8'),
+        'ws-v2',
+      );
+      // config.json must remain byte-for-byte untouched
+      assert.equal(await sandbox.readConfigRaw(), initialCfg);
 
       await session.click('[data-action="set-filter"][data-value="builtin"]');
       const biCard = await session.getCardInfo('builtin:core-bi');
       assert.equal(biCard.exists, true);
-      assert.equal(biCard.ariaChecked, 'true');
+      assert.ok(biCard.badges.includes('Enabled'));
     } finally {
-      if (lock) await lock.forceKill();
       if (session) await session.close();
       await mcp.close();
       await sandbox.cleanup();
     }
   });
 
-  test('E2E-T4-04: Failed Update Recovery Journey (Broken v2 -> Preserved Lock & enabled -> Fix v2 -> Update & Restore)', async () => {
+  test('E2E-T4-04: Failed Update Recovery Journey (Broken v2 -> Preserved v1 & config.json -> Fix v2 -> Update Succeeds)', async () => {
     const sandbox = await createSandbox();
     const mcp = spawnMcpClient({ dataDir: sandbox.dataDir, env: sandbox.env() });
     let session;
-    let lock;
     try {
       const srcDir = await sandbox.createPluginSource('recover-p', {
         manifest: { name: 'recover-p', displayName: 'Recover P', version: '1.0.0' },
         files: { 'marker.txt': 'v1-intact' },
       });
+      const initialCfg = JSON.stringify({ plugins: { 'recover-p': { enabled: true } } }, null, 2);
+      await sandbox.writeConfig(initialCfg);
       await mcp.initialize();
       await mcp.callTool('app_install_plugin', { source: srcDir });
-      await mcp.callTool('app_set_plugin_enabled', {
-        dir: 'recover-p',
-        scope: 'global',
-        enabled: true,
-      });
 
       const installedDir = path.join(sandbox.globalPluginsDir, 'recover-p');
-      lock = await spawnLockedPluginProcess({
-        pluginDir: installedDir,
-        configPath: sandbox.configPath,
-        dirName: 'recover-p',
-        releaseOnDisable: true,
-        releaseDelayMs: 150,
-      });
-      sandbox.trackChild(lock.child);
-
       session = await browser.openAppSession({ mcpClient: mcp });
 
       // Step 1: Break v2 source manifest and attempt Update
@@ -301,11 +271,8 @@ describe('Tier 4: Real-World End-to-End Application Scenarios (6 cases)', () => 
 
       await session.click('.plugin-card[data-plugin-id="global:recover-p"] [data-action="reinstall"]');
       await session.waitForSelector('.toast.error', { timeoutMs: 10000 });
-
-      assert.equal(lock.isAlive(), true);
-      assert.equal(lock.wasReleasedByConfigDisable(), false);
       assert.equal(await fs.readFile(path.join(installedDir, 'marker.txt'), 'utf8'), 'v1-intact');
-      assert.equal((await sandbox.readConfig()).plugins['recover-p'].enabled, true);
+      assert.equal(await sandbox.readConfigRaw(), initialCfg);
 
       // Step 2: Fix v2 source and retry Update
       await sandbox.createPluginSource('recover-p', {
@@ -324,15 +291,9 @@ describe('Tier 4: Real-World End-to-End Application Scenarios (6 cases)', () => 
         { timeoutMs: 15000, label: 'recover-p updated to v2.0.0 after fix' },
       );
 
-      await lock.waitForExit(5000);
-      assert.equal(lock.wasReleasedByConfigDisable(), true);
       assert.equal(await fs.readFile(path.join(installedDir, 'marker.txt'), 'utf8'), 'v2-fixed');
-
-      const card = await session.getCardInfo('global:recover-p');
-      assert.equal(card.ariaChecked, 'true');
-      assert.equal((await sandbox.readConfig()).plugins['recover-p'].enabled, true);
+      assert.equal(await sandbox.readConfigRaw(), initialCfg);
     } finally {
-      if (lock) await lock.forceKill();
       if (session) await session.close();
       await mcp.close();
       await sandbox.cleanup();
@@ -370,13 +331,7 @@ describe('Tier 4: Real-World End-to-End Application Scenarios (6 cases)', () => 
 
       session = await browser.openAppSession({ mcpClient: mcp });
 
-      // Attempt self-disable via UI
-      await session.clickCardToggle('global:plugin-installer');
-      await session.waitForSelector('.toast.error');
-      const selfCard = await session.getCardInfo('global:plugin-installer');
-      assert.equal(selfCard.ariaChecked, 'true');
-
-      // Attempt self-overwrite via MCP
+      // Attempt self-overwrite and self-uninstall via MCP
       const selfOw = await mcp.callTool('app_install_plugin', {
         source: evilSelfSrc,
         targetDirName: 'plugin-installer',
@@ -385,7 +340,14 @@ describe('Tier 4: Real-World End-to-End Application Scenarios (6 cases)', () => 
       assert.equal(selfOw.structuredContent.ok, false);
       assert.equal(selfOw.structuredContent.code, 'SELF_UPDATE_BLOCKED');
 
-      // Sibling full lifecycle via UI: install, disable, update, uninstall
+      const selfUn = await mcp.callTool('app_uninstall_plugin', {
+        dir: 'plugin-installer',
+        scope: 'global',
+      });
+      assert.equal(selfUn.structuredContent.ok, false);
+      assert.equal(selfUn.structuredContent.code, 'SELF_UNINSTALL_BLOCKED');
+
+      // Sibling full lifecycle via UI: install, native guide, update, uninstall
       await session.click('[data-action="open-modal"]');
       await session.setInputValue('#modal-source-input', sibSrc);
       await session.click('#modal-submit-btn');
@@ -393,8 +355,8 @@ describe('Tier 4: Real-World End-to-End Application Scenarios (6 cases)', () => 
       await session.click('.modal-footer-row [data-action="close-modal"]');
       await session.waitForSelector('.plugin-card[data-plugin-id="global:sibling-p"]');
 
-      await session.clickCardToggle('global:sibling-p');
-      await session.waitForToggleState('global:sibling-p', false);
+      await session.click('.plugin-card[data-plugin-id="global:sibling-p"] [data-action="toggle-manage-native"]');
+      await session.waitForSelector('.plugin-card[data-plugin-id="global:sibling-p"] .native-guide-box');
 
       await sandbox.createPluginSource('sibling-p', {
         targetDir: sibSrc,
@@ -408,9 +370,8 @@ describe('Tier 4: Real-World End-to-End Application Scenarios (6 cases)', () => 
           return Boolean(card && card.innerText.includes('v2.0.0'));
         },
         [],
-        { timeoutMs: 12000, label: 'sibling updated while staying disabled' },
+        { timeoutMs: 12000, label: 'sibling updated' },
       );
-      assert.equal((await session.getCardInfo('global:sibling-p')).ariaChecked, 'false');
 
       await session.click('.plugin-card[data-plugin-id="global:sibling-p"] [data-action="ask-uninstall"]');
       await session.click('.plugin-card[data-plugin-id="global:sibling-p"] [data-action="confirm-uninstall"]');
@@ -419,8 +380,6 @@ describe('Tier 4: Real-World End-to-End Application Scenarios (6 cases)', () => 
         [],
         { label: 'sibling uninstalled' },
       );
-
-      assert.equal((await sandbox.readConfig()).plugins['plugin-installer'].enabled, true);
     } finally {
       if (session) await session.close();
       if (mcp) await mcp.close();
@@ -428,11 +387,10 @@ describe('Tier 4: Real-World End-to-End Application Scenarios (6 cases)', () => 
     }
   });
 
-  test('E2E-T4-06: Bilingual zh/en Dark-Mode Narrow Aux-Pane Workflow + agy CLI Sync + Locked Update', async () => {
+  test('E2E-T4-06: Bilingual zh/en Dark-Mode Narrow Aux-Pane Workflow + Chat Jump Link + External Sync', async () => {
     const sandbox = await createSandbox();
     const mcp = spawnMcpClient({ dataDir: sandbox.dataDir, env: sandbox.env() });
     let session;
-    let lock;
     try {
       const srcDir = await sandbox.createPluginSource('aux-p', {
         manifest: { name: 'aux-p', displayName: 'Aux Pane Plugin', version: '1.0.0' },
@@ -444,6 +402,7 @@ describe('Tier 4: Real-World End-to-End Application Scenarios (6 cases)', () => 
       session = await browser.openAppSession({
         mcpClient: mcp,
         hostContext: { theme: 'dark', locale: 'zh-CN' },
+        hostCapabilities: { serverTools: {}, openLinks: {}, message: {} },
         viewport: { width: 440, height: 720 },
       });
 
@@ -453,17 +412,23 @@ describe('Tier 4: Real-World End-to-End Application Scenarios (6 cases)', () => 
       );
       await session.waitForText('已启用');
 
-      // Toggle off in Chinese UI
-      await session.clickCardToggle('global:aux-p');
+      // Open native management guide & send customization://aux-p link to chat
+      await session.click('.plugin-card[data-plugin-id="global:aux-p"] [data-action="toggle-manage-native"]');
+      await session.waitForSelector('.plugin-card[data-plugin-id="global:aux-p"] [data-action="send-native-link"]');
+      await session.click('.plugin-card[data-plugin-id="global:aux-p"] [data-action="send-native-link"]');
+      await session.waitForSelector('.toast');
+
+      const sent = await session.getSentMessages();
+      assert.equal(sent.length, 1);
+      assert.match(JSON.stringify(sent[0]), /customization:\/\/aux-p/);
+
+      // External disable via agy CLI and refresh UI
+      assert.equal((await sandbox.runAgy(['plugin', 'disable', 'aux-p'])).code, 0);
+      await session.click('[data-action="refresh"]');
       await session.waitForText('已禁用');
-      assert.equal(
-        extractAgyPluginEntry((await sandbox.runAgy(['plugin', 'list', '--json'])).stdout, 'aux-p').enabled,
-        false,
-      );
 
       // Re-enable externally via agy CLI and refresh UI
-      const agyEn = await sandbox.runAgy(['plugin', 'enable', 'aux-p']);
-      assert.equal(agyEn.code, 0, agyEn.stderr);
+      assert.equal((await sandbox.runAgy(['plugin', 'enable', 'aux-p'])).code, 0);
       await session.click('[data-action="refresh"]');
       await session.waitForText('已启用');
 
@@ -471,17 +436,7 @@ describe('Tier 4: Real-World End-to-End Application Scenarios (6 cases)', () => 
       await session.click('[data-action="toggle-locale"]');
       await session.waitForText('Enabled');
 
-      // Lock & update via narrow dark-mode English UI
-      const installedDir = path.join(sandbox.globalPluginsDir, 'aux-p');
-      lock = await spawnLockedPluginProcess({
-        pluginDir: installedDir,
-        configPath: sandbox.configPath,
-        dirName: 'aux-p',
-        releaseOnDisable: true,
-        releaseDelayMs: 150,
-      });
-      sandbox.trackChild(lock.child);
-
+      // Update via narrow dark-mode English UI
       await sandbox.createPluginSource('aux-p', {
         targetDir: srcDir,
         manifest: { name: 'aux-p', displayName: 'Aux Pane Plugin', version: '2.0.0' },
@@ -498,19 +453,15 @@ describe('Tier 4: Real-World End-to-End Application Scenarios (6 cases)', () => 
         { timeoutMs: 15000, label: 'aux-p updated to v2.0.0' },
       );
 
-      await lock.waitForExit(5000);
-      assert.equal(lock.wasReleasedByConfigDisable(), true);
-
       const finalCard = await session.getCardInfo('global:aux-p');
-      assert.equal(finalCard.ariaChecked, 'true');
-      assert.ok(finalCard.toggleRect.right <= finalCard.viewportWidth + 1);
+      assert.equal(finalCard.toggleExists, false);
+      assert.ok(finalCard.manageBtnRect.right <= finalCard.viewportWidth + 1);
       assert.ok(finalCard.scrollWidth <= finalCard.viewportWidth + 1);
       assert.equal(
         extractAgyPluginEntry((await sandbox.runAgy(['plugin', 'list', '--json'])).stdout, 'aux-p').enabled,
         true,
       );
     } finally {
-      if (lock) await lock.forceKill();
       if (session) await session.close();
       await mcp.close();
       await sandbox.cleanup();

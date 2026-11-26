@@ -12,7 +12,7 @@ import {
   isSamePath,
   readEnabledOverrides,
   registryKey,
-  setPluginEnabled as defaultSetPluginEnabled,
+  renameWithRetry,
 } from './plugins.mjs';
 import {
   findManifestPath,
@@ -24,6 +24,10 @@ import {
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PLUGIN_ROOT = path.resolve(__dirname, '..');
 const RETRYABLE_RM_CODES = new Set(['EBUSY', 'EPERM', 'EACCES', 'ENOTEMPTY']);
+const DEFAULT_REPLACE_RETRIES = 6;
+const DEFAULT_REPLACE_RETRY_DELAY_MS = 250;
+const DISABLED_RENAME_RETRIES = 2;
+const DISABLED_RENAME_RETRY_DELAY_MS = 100;
 
 const execFileAsync = promisify(execFile);
 
@@ -482,7 +486,7 @@ async function fetchGitHubToDir(spec, stageDir, steps) {
       if (!topDir) {
         throw new Error('Downloaded GitHub archive did not contain a repository folder.');
       }
-      await fs.rename(path.join(extractDir, topDir.name), repoDir);
+      await renameWithRetry(path.join(extractDir, topDir.name), repoDir);
       cloned = true;
       steps.push({
         phase: 'fetch',
@@ -750,15 +754,284 @@ async function removeBackupWithRetry(backupPath, steps) {
   }
 }
 
+function resolveRelativeLockedPath(destPath, candidates) {
+  if (!destPath) return '';
+  for (const candidate of candidates) {
+    if (!candidate || typeof candidate !== 'string') continue;
+    const rel = path.relative(destPath, candidate).replace(/\\/g, '/');
+    if (rel && !rel.startsWith('..') && !path.isAbsolute(rel)) {
+      return rel;
+    }
+  }
+  return '';
+}
+
+function createLockError(
+  dirName,
+  code,
+  err,
+  { alreadyDisabled = false, failedPath = '', destPath = '' } = {},
+) {
+  const customizationUri = `customization://${dirName}`;
+  const rawMsg = err instanceof Error ? err.message : String(err);
+  const rel = resolveRelativeLockedPath(destPath, [
+    failedPath,
+    err && typeof err === 'object' ? err.dest : '',
+    err && typeof err === 'object' ? err.path : '',
+  ]);
+  const relDetail = rel ? ` at "${rel}"` : '';
+  const message = alreadyDisabled
+    ? `Failed to update disabled plugin "${dirName}" because files are locked (${code})${relDetail} by Antigravity or another process. Restart Antigravity or close the process holding the files, then retry: ${rawMsg}`
+    : `Failed to replace existing plugin directory "${dirName}" because files are locked (${code}). Disable "${dirName}" in Antigravity Customizations (${customizationUri}) first so its running MCP servers or sidecars stop, then retry: ${rawMsg}`;
+
+  const lockErr = new Error(message);
+  lockErr.code = code;
+  lockErr.locked = true;
+  lockErr.alreadyDisabled = Boolean(alreadyDisabled);
+  lockErr.customizationUri = customizationUri;
+  return lockErr;
+}
+
+async function withFileOpRetry(fn, { targetPath = '', retries = 4, delayMs = 80 } = {}) {
+  const maxAttempts = Math.max(1, Number(retries) + 1);
+  const waitMs = Math.max(0, Number(delayMs) || 0);
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      return await fn();
+    } catch (err) {
+      const code = err && typeof err === 'object' ? err.code : '';
+      if (RETRYABLE_RM_CODES.has(code) && attempt < maxAttempts) {
+        if ((code === 'EPERM' || code === 'EACCES') && targetPath) {
+          await fs.chmod(targetPath, 0o666).catch(() => {});
+        }
+        if (waitMs > 0) await sleep(waitMs);
+        continue;
+      }
+      throw err;
+    }
+  }
+  return undefined;
+}
+
+async function clearReadOnlyRecursive(targetPath) {
+  let st;
+  try {
+    st = await fs.lstat(targetPath);
+  } catch {
+    return;
+  }
+  if (st.isSymbolicLink()) return;
+  if (st.isDirectory()) {
+    await fs.chmod(targetPath, 0o777).catch(() => {});
+    const entries = await fs.readdir(targetPath).catch(() => []);
+    for (const name of entries) {
+      await clearReadOnlyRecursive(path.join(targetPath, name));
+    }
+  } else {
+    await fs.chmod(targetPath, 0o666).catch(() => {});
+  }
+}
+
+async function removeEntryWithRetry(entryPath, { retries = 4, delayMs = 80 } = {}) {
+  let st;
+  try {
+    st = await fs.lstat(entryPath);
+  } catch (err) {
+    if (err && err.code === 'ENOENT') return;
+    throw err;
+  }
+  if (st.isSymbolicLink() || !st.isDirectory()) {
+    await withFileOpRetry(() => fs.unlink(entryPath), { targetPath: entryPath, retries, delayMs });
+    return;
+  }
+  await withFileOpRetry(
+    async () => {
+      try {
+        await fs.rm(entryPath, { recursive: true, force: true, maxRetries: 3, retryDelay: 40 });
+      } catch (err) {
+        const code = err && typeof err === 'object' ? err.code : '';
+        if (code === 'EPERM' || code === 'EACCES') {
+          await clearReadOnlyRecursive(entryPath);
+        }
+        throw err;
+      }
+    },
+    { targetPath: entryPath, retries, delayMs },
+  );
+}
+
+async function dirContainsNonDirEntries(dirPath) {
+  let entries;
+  try {
+    entries = await fs.readdir(dirPath, { withFileTypes: true });
+  } catch (err) {
+    if (err && err.code === 'ENOENT') return false;
+    throw err;
+  }
+  for (const entry of entries) {
+    if (entry.isSymbolicLink() || !entry.isDirectory()) {
+      return true;
+    }
+    if (await dirContainsNonDirEntries(path.join(dirPath, entry.name))) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function normalizeEntryKey(name) {
+  return process.platform === 'win32' ? name.toLowerCase() : name;
+}
+
+/**
+ * Synchronize `srcDir` into an existing `destDir` in-place without renaming or
+ * removing `destDir` itself. Handles Windows directory-watcher handles (e.g.
+ * `language_server.exe` holding `ReadDirectoryChangesW` handles on disabled
+ * plugin subdirectories) while still failing loudly if any individual file is
+ * genuinely locked.
+ */
+async function synchronizeDirInPlace(
+  srcDir,
+  destDir,
+  { skipNames = SKIP_COPY_NAMES, bestEffort = false, retainedEmptyDirs = null } = {},
+) {
+  const runOp = async (op) => {
+    if (!bestEffort) return op();
+    try {
+      return await op();
+    } catch {
+      return undefined;
+    }
+  };
+
+  async function copyPhase(curSrc, curDest) {
+    await runOp(() => fs.mkdir(curDest, { recursive: true }));
+    let srcEntries;
+    try {
+      srcEntries = await fs.readdir(curSrc, { withFileTypes: true });
+    } catch (err) {
+      if (bestEffort) return;
+      throw err;
+    }
+
+    for (const entry of srcEntries) {
+      if (skipNames.has(entry.name)) continue;
+      const srcPath = path.join(curSrc, entry.name);
+      const destPath = path.join(curDest, entry.name);
+      const destStat = await fs.lstat(destPath).catch(() => null);
+
+      if (entry.isDirectory()) {
+        if (destStat && (!destStat.isDirectory() || destStat.isSymbolicLink())) {
+          await runOp(() => removeEntryWithRetry(destPath));
+        }
+        await copyPhase(srcPath, destPath);
+      } else if (entry.isSymbolicLink()) {
+        if (destStat) {
+          await runOp(() => removeEntryWithRetry(destPath));
+        }
+        await runOp(async () => {
+          const target = await fs.readlink(srcPath);
+          await withFileOpRetry(() => fs.symlink(target, destPath), { targetPath: destPath });
+        });
+      } else if (entry.isFile()) {
+        if (destStat && (destStat.isDirectory() || destStat.isSymbolicLink())) {
+          await runOp(() => removeEntryWithRetry(destPath));
+        }
+        await runOp(() =>
+          withFileOpRetry(() => fs.copyFile(srcPath, destPath), { targetPath: destPath }),
+        );
+      }
+    }
+  }
+
+  async function prunePhase(curSrc, curDest) {
+    let destEntries;
+    try {
+      destEntries = await fs.readdir(curDest, { withFileTypes: true });
+    } catch (err) {
+      if ((err && err.code === 'ENOENT') || bestEffort) return;
+      throw err;
+    }
+
+    const expectedMap = new Map();
+    if (curSrc) {
+      let srcEntries = [];
+      try {
+        srcEntries = await fs.readdir(curSrc, { withFileTypes: true });
+      } catch (err) {
+        if (!bestEffort && (!err || err.code !== 'ENOENT')) throw err;
+      }
+      for (const entry of srcEntries) {
+        if (skipNames.has(entry.name)) continue;
+        expectedMap.set(normalizeEntryKey(entry.name), entry);
+      }
+    }
+
+    for (const destEntry of destEntries) {
+      const destChild = path.join(curDest, destEntry.name);
+      const key = normalizeEntryKey(destEntry.name);
+      const srcEntry = expectedMap.get(key);
+
+      if (srcEntry) {
+        if (
+          destEntry.isDirectory() &&
+          !destEntry.isSymbolicLink() &&
+          srcEntry.isDirectory() &&
+          !srcEntry.isSymbolicLink()
+        ) {
+          await prunePhase(path.join(curSrc, srcEntry.name), destChild);
+        }
+        continue;
+      }
+
+      // Obsolete entry in destDir
+      if (destEntry.isSymbolicLink() || !destEntry.isDirectory()) {
+        await runOp(() =>
+          withFileOpRetry(() => fs.unlink(destChild), { targetPath: destChild }),
+        );
+      } else {
+        // Recursively prune all files and nested dirs deepest-first
+        await prunePhase(null, destChild);
+        await runOp(async () => {
+          try {
+            await withFileOpRetry(() => fs.rmdir(destChild), {
+              targetPath: destChild,
+              retries: 2,
+              delayMs: 60,
+            });
+          } catch (err) {
+            const code = err && typeof err === 'object' ? err.code : '';
+            if (code === 'ENOENT') return;
+            if (RETRYABLE_RM_CODES.has(code)) {
+              const hasFiles = await dirContainsNonDirEntries(destChild);
+              if (!hasFiles) {
+                if (Array.isArray(retainedEmptyDirs)) {
+                  retainedEmptyDirs.push(destChild);
+                }
+                return;
+              }
+            }
+            throw err;
+          }
+        });
+      }
+    }
+  }
+
+  await copyPhase(srcDir, destDir);
+  await prunePhase(srcDir, destDir);
+}
+
 async function prepareExistingForReplaceWithRetry(
   destPath,
   isSymlink,
   {
-    retries = 12,
-    delayMs = 450,
+    retries = DEFAULT_REPLACE_RETRIES,
+    delayMs = DEFAULT_REPLACE_RETRY_DELAY_MS,
     removeTarget = null,
     moveExistingToBackup = null,
     backupPath = '',
+    alreadyDisabled = false,
   } = {},
 ) {
   const maxAttempts = Math.max(1, Number(retries) + 1);
@@ -785,11 +1058,10 @@ async function prepareExistingForReplaceWithRetry(
       const canRetry = RETRYABLE_RM_CODES.has(code) && attempt < maxAttempts;
       if (!canRetry) {
         if (RETRYABLE_RM_CODES.has(code)) {
-          const lockErr = new Error(
-            `Failed to replace existing plugin directory "${path.basename(destPath)}" because files are locked (${code}): ${err instanceof Error ? err.message : String(err)}`,
-          );
-          lockErr.code = code;
-          throw lockErr;
+          throw createLockError(path.basename(destPath), code, err, {
+            alreadyDisabled,
+            destPath,
+          });
         }
         throw err;
       }
@@ -813,11 +1085,8 @@ export async function installPlugin({
   targetDirName = '',
   overwrite = false,
   installRegistry = null,
-  isPluginEnabled = null,
-  setPluginEnabled = null,
-  disableSettleMs = 400,
-  removeRetries = 12,
-  removeRetryDelayMs = 450,
+  removeRetries = DEFAULT_REPLACE_RETRIES,
+  removeRetryDelayMs = DEFAULT_REPLACE_RETRY_DELAY_MS,
   removeTarget = null,
   moveExistingToBackup = null,
   pluginRoot = PLUGIN_ROOT,
@@ -837,6 +1106,7 @@ export async function installPlugin({
   }
 
   const stageDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agy-plugin-install-'));
+  let tmpBackupDir = '';
 
   try {
     let sourcePluginRoot = '';
@@ -921,20 +1191,17 @@ export async function installPlugin({
       existingStat = null;
     }
 
-    let wasEnabled = false;
-    let autoDisabled = false;
-    let restoredEnabled = false;
     let finalEnabled = validation.manifest?.disabled !== true;
-    let hasExplicitOverride = false;
     let removedExisting = false;
     let backupPath = '';
     let movedToBackup = false;
+    let usedInPlaceSync = false;
+    let inPlaceBackupReady = false;
+    let tmpBackupCopy = '';
     const previousLinkTarget = existingStat?.isSymbolicLink()
       ? await fs.readlink(destPath).catch(() => null)
       : null;
-
-    const toggleFn =
-      typeof setPluginEnabled === 'function' ? setPluginEnabled : defaultSetPluginEnabled;
+    let existingEnabledState = null;
 
     if (existingStat) {
       if (!overwrite) {
@@ -954,29 +1221,18 @@ export async function installPlugin({
         throw selfErr;
       }
 
-      if (typeof isPluginEnabled === 'function') {
-        wasEnabled = Boolean(await isPluginEnabled(dirName, destPath));
-      } else {
-        const existingState = await resolveExistingEnabledState(dirName, destPath);
-        wasEnabled = existingState.enabled;
-        hasExplicitOverride = existingState.hasOverride;
-      }
-
-      if (wasEnabled) {
-        await toggleFn(dirName, false);
-        autoDisabled = true;
-        steps.push({
-          phase: 'disable',
-          status: 'ok',
-          message: `Temporarily disabled "${dirName}" before updating.`,
-        });
-        if (disableSettleMs > 0) {
-          await sleep(disableSettleMs);
-        }
-      }
+      existingEnabledState = await resolveExistingEnabledState(dirName, destPath);
     }
 
     const effectiveMode = parsed.type === 'local' && mode === 'link' ? 'link' : 'copy';
+    const isAlreadyDisabled = Boolean(existingEnabledState && existingEnabledState.enabled === false);
+    const canFallbackInPlace =
+      Boolean(existingStat) &&
+      existingStat.isDirectory() &&
+      !existingStat.isSymbolicLink() &&
+      effectiveMode === 'copy' &&
+      isAlreadyDisabled &&
+      typeof removeTarget !== 'function';
 
     try {
       if (existingStat) {
@@ -984,46 +1240,106 @@ export async function installPlugin({
           resolvedTargetRoot,
           `.${dirName}.backup-${Date.now()}-${process.pid}-${Math.random().toString(16).slice(2, 8)}`,
         );
-        const prep = await prepareExistingForReplaceWithRetry(
-          destPath,
-          existingStat.isSymbolicLink(),
-          {
-            retries: removeRetries,
-            delayMs: removeRetryDelayMs,
-            removeTarget,
-            moveExistingToBackup,
-            backupPath: candidateBackupPath,
-          },
-        );
-        removedExisting = true;
-        if (prep.backupPath) {
-          backupPath = prep.backupPath;
-          movedToBackup = true;
+        const renameRetries = canFallbackInPlace
+          ? Math.min(removeRetries, DISABLED_RENAME_RETRIES)
+          : removeRetries;
+        const renameDelayMs = canFallbackInPlace
+          ? Math.min(removeRetryDelayMs, DISABLED_RENAME_RETRY_DELAY_MS)
+          : removeRetryDelayMs;
+
+        try {
+          const prep = await prepareExistingForReplaceWithRetry(
+            destPath,
+            existingStat.isSymbolicLink(),
+            {
+              retries: renameRetries,
+              delayMs: renameDelayMs,
+              removeTarget,
+              moveExistingToBackup,
+              backupPath: candidateBackupPath,
+              alreadyDisabled: isAlreadyDisabled,
+            },
+          );
+          removedExisting = true;
+          if (prep.backupPath) {
+            backupPath = prep.backupPath;
+            movedToBackup = true;
+          }
+          steps.push({
+            phase: 'replace',
+            status: 'ok',
+            message: movedToBackup
+              ? `Backed up previous installation of "${dirName}" before replacement.`
+              : `Removed previous installation at "${dirName}".`,
+          });
+        } catch (prepErr) {
+          const prepCode = prepErr && typeof prepErr === 'object' ? prepErr.code : '';
+          if (canFallbackInPlace && prepErr?.locked && RETRYABLE_RM_CODES.has(prepCode)) {
+            // Whole-directory rename is blocked (e.g. language_server.exe holding a
+            // directory watcher handle on Windows) while the plugin is already disabled.
+            // Back up to os.tmpdir() (outside plugins root) and synchronize files in-place.
+            tmpBackupDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agy-plugin-backup-'));
+            tmpBackupCopy = path.join(tmpBackupDir, 'backup');
+            try {
+              await fs.cp(destPath, tmpBackupCopy, {
+                recursive: true,
+                force: true,
+                verbatimSymlinks: true,
+              });
+            } catch (cpErr) {
+              const cpCode = cpErr && typeof cpErr === 'object' ? cpErr.code : '';
+              if (RETRYABLE_RM_CODES.has(cpCode)) {
+                throw createLockError(dirName, cpCode, cpErr, {
+                  alreadyDisabled: true,
+                  failedPath: cpErr.path || '',
+                  destPath,
+                });
+              }
+              throw cpErr;
+            }
+            usedInPlaceSync = true;
+            inPlaceBackupReady = true;
+
+            const retainedEmptyDirs = [];
+            await synchronizeDirInPlace(sourcePluginRoot, destPath, {
+              skipNames: SKIP_COPY_NAMES,
+              retainedEmptyDirs,
+            });
+            steps.push({
+              phase: 'replace',
+              status: 'ok',
+              message: `Directory handle was watched/locked (${prepCode}); synchronized disabled plugin "${dirName}" in-place.`,
+            });
+            if (retainedEmptyDirs.length > 0) {
+              steps.push({
+                phase: 'cleanup',
+                status: 'warn',
+                message: `Updated cleanly, but ${retainedEmptyDirs.length} obsolete empty folder(s) remained watched by the host and could not be removed yet.`,
+              });
+            }
+          } else {
+            throw prepErr;
+          }
         }
-        steps.push({
-          phase: 'replace',
-          status: 'ok',
-          message: movedToBackup
-            ? `Backed up previous installation of "${dirName}" before replacement.`
-            : `Removed previous installation at "${dirName}".`,
-        });
       }
 
-      if (effectiveMode === 'link') {
-        const linkType = process.platform === 'win32' ? 'junction' : 'dir';
-        await fs.symlink(sourcePluginRoot, destPath, linkType);
-        steps.push({
-          phase: 'install',
-          status: 'ok',
-          message: `Linked local plugin (${linkType}) -> ${destPath}`,
-        });
-      } else {
-        await copyDirFiltered(sourcePluginRoot, destPath);
-        steps.push({
-          phase: 'install',
-          status: 'ok',
-          message: `Installed plugin files to ${destPath}`,
-        });
+      if (!usedInPlaceSync) {
+        if (effectiveMode === 'link') {
+          const linkType = process.platform === 'win32' ? 'junction' : 'dir';
+          await fs.symlink(sourcePluginRoot, destPath, linkType);
+          steps.push({
+            phase: 'install',
+            status: 'ok',
+            message: `Linked local plugin (${linkType}) -> ${destPath}`,
+          });
+        } else {
+          await copyDirFiltered(sourcePluginRoot, destPath);
+          steps.push({
+            phase: 'install',
+            status: 'ok',
+            message: `Installed plugin files to ${destPath}`,
+          });
+        }
       }
 
       const meta = {
@@ -1047,27 +1363,8 @@ export async function installPlugin({
         await installRegistry.record(registryKey(scope, dirName, workspacePath), meta);
       }
 
-      if (existingStat) {
-        if (wasEnabled) {
-          await toggleFn(dirName, true);
-          restoredEnabled = true;
-          finalEnabled = true;
-          steps.push({
-            phase: 'enable',
-            status: 'ok',
-            message: `Restored enabled state for "${dirName}".`,
-          });
-        } else {
-          if (!hasExplicitOverride && validation.manifest?.disabled !== true) {
-            await toggleFn(dirName, false);
-          }
-          restoredEnabled = false;
-          finalEnabled = false;
-        }
-      } else {
-        const currentState = await resolveExistingEnabledState(dirName, destPath);
-        finalEnabled = currentState.enabled;
-      }
+      const currentState = await resolveExistingEnabledState(dirName, destPath);
+      finalEnabled = currentState.enabled;
 
       if (backupPath && (await pathExists(backupPath))) {
         await removeBackupWithRetry(backupPath, steps);
@@ -1076,12 +1373,11 @@ export async function installPlugin({
       return {
         ok: true,
         overwrote: Boolean(existingStat),
-        wasEnabled,
-        autoDisabled,
-        restoredEnabled,
+        replacementMode: usedInPlaceSync ? 'in-place' : existingStat ? 'replace' : 'fresh',
         enabled: finalEnabled,
         plugin: {
           dir: dirName,
+          customizationUri: `customization://${dirName}`,
           name: meta.name,
           displayName: meta.displayName,
           version: meta.version,
@@ -1098,25 +1394,36 @@ export async function installPlugin({
       };
     } catch (err) {
       let cleanupOk = true;
-      let restoreOk = true;
 
-      if (movedToBackup && backupPath && (await pathExists(backupPath))) {
+      if (usedInPlaceSync) {
+        if (inPlaceBackupReady && tmpBackupCopy && (await pathExists(tmpBackupCopy))) {
+          await synchronizeDirInPlace(tmpBackupCopy, destPath, {
+            skipNames: new Set(),
+            bestEffort: true,
+          }).catch(() => {});
+        }
+        const errCode = err && typeof err === 'object' ? err.code : '';
+        if (!err?.locked && RETRYABLE_RM_CODES.has(errCode)) {
+          throw createLockError(dirName, errCode, err, {
+            alreadyDisabled: true,
+            failedPath: (err && typeof err === 'object' ? err.dest || err.path : '') || '',
+            destPath,
+          });
+        }
+      } else if (movedToBackup && backupPath && (await pathExists(backupPath))) {
         if (await pathExists(destPath)) {
           try {
             await removePathSafe(destPath);
           } catch {
             cleanupOk = false;
-            restoreOk = false;
           }
         }
         if (cleanupOk && !(await pathExists(destPath))) {
           try {
-            await fs.rename(backupPath, destPath);
+            await renameWithRetry(backupPath, destPath);
           } catch {
-            restoreOk = false;
+            // Rollback failed; original error is rethrown below
           }
-        } else {
-          restoreOk = false;
         }
       } else if (
         existingStat?.isSymbolicLink() &&
@@ -1128,7 +1435,6 @@ export async function installPlugin({
             await removePathSafe(destPath);
           } catch {
             cleanupOk = false;
-            restoreOk = false;
           }
         }
         if (cleanupOk && !(await pathExists(destPath))) {
@@ -1136,25 +1442,17 @@ export async function installPlugin({
           try {
             await fs.symlink(previousLinkTarget, destPath, linkType);
           } catch {
-            restoreOk = false;
+            // Rollback failed; original error is rethrown below
           }
-        } else {
-          restoreOk = false;
         }
       }
 
-      const hasValidManifest =
-        cleanupOk &&
-        restoreOk &&
-        (await pathExists(destPath)) &&
-        Boolean(await findManifestPath(destPath).catch(() => null));
-
-      if (autoDisabled && hasValidManifest) {
-        await toggleFn(dirName, true).catch(() => {});
-      }
       throw err;
     }
   } finally {
     await fs.rm(stageDir, { recursive: true, force: true }).catch(() => {});
+    if (tmpBackupDir) {
+      await fs.rm(tmpBackupDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 }).catch(() => {});
+    }
   }
 }

@@ -8,6 +8,7 @@ import { detectLocale, getMessages } from './i18n';
 import type {
   InstallResultPayload,
   InstallScope,
+  InstallToolResponse,
   InventoryPayload,
   LocalInstallMode,
   Locale,
@@ -50,6 +51,8 @@ interface AppState {
   filter: 'all' | 'user' | 'workspace' | 'builtin';
   search: string;
   expandedIds: Set<string>;
+  manageGuideId: string | null;
+  canSendMessage: boolean;
   confirmUninstallId: string | null;
   busyPluginId: string | null;
   toast: { type: 'success' | 'error'; text: string } | null;
@@ -69,6 +72,8 @@ const state: AppState = {
   filter: 'all',
   search: '',
   expandedIds: new Set(),
+  manageGuideId: null,
+  canSendMessage: false,
   confirmUninstallId: null,
   busyPluginId: null,
   toast: null,
@@ -104,6 +109,25 @@ function esc(value: string): string {
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&#39;');
+}
+
+const GENERIC_ERROR_CODES = new Set(['INSTALL_FAILED', 'REINSTALL_FAILED', 'UNINSTALL_FAILED']);
+
+function formatLockedError(baseMessage: string, code?: string, detail?: string): string {
+  const cleanCode = typeof code === 'string' && !GENERIC_ERROR_CODES.has(code) ? code.trim() : '';
+  const cleanDetail = typeof detail === 'string' ? detail.replace(/\s+/g, ' ').trim() : '';
+  const compactDetail = cleanDetail.length > 220 ? `${cleanDetail.slice(0, 217)}...` : cleanDetail;
+
+  if (compactDetail) {
+    if (cleanCode && !compactDetail.toUpperCase().includes(cleanCode.toUpperCase())) {
+      return `${baseMessage} [${cleanCode}: ${compactDetail}]`;
+    }
+    return `${baseMessage} [${compactDetail}]`;
+  }
+  if (cleanCode) {
+    return `${baseMessage} [${cleanCode}]`;
+  }
+  return baseMessage;
 }
 
 function showToast(type: 'success' | 'error', text: string) {
@@ -275,15 +299,7 @@ async function submitInstall(forceOverwrite = false) {
       arguments: args,
     });
 
-    const sc = res.structuredContent as
-      | {
-          ok: boolean;
-          install?: InstallResultPayload;
-          inventory?: InventoryPayload;
-          error?: string;
-          code?: string;
-        }
-      | undefined;
+    const sc = res.structuredContent as InstallToolResponse | undefined;
 
     m.submitting = false;
     if (sc?.ok && sc.install) {
@@ -293,20 +309,22 @@ async function submitInstall(forceOverwrite = false) {
       }
       const msg = getMessages(state.locale);
       const overwroteExisting = sc.install.overwrote ?? Boolean(args.overwrite);
-      const toastLabel = sc.install.restoredEnabled
-        ? msg.toastUpdatedRestored
-        : overwroteExisting && sc.install.wasEnabled === false && sc.install.enabled === false
-          ? msg.toastUpdatedKeptDisabled
-          : overwroteExisting
-            ? msg.toastUpdated
-            : msg.toastInstalled;
+      const toastLabel = overwroteExisting ? msg.toastUpdated : msg.toastInstalled;
       showToast('success', `${toastLabel}: ${sc.install.plugin.displayName}`);
     } else {
       const msg = getMessages(state.locale);
+      const isLocked = sc?.locked === true;
+      const isAlreadyDisabled = Boolean(sc?.alreadyDisabled);
       m.error =
         sc?.code === 'SELF_UPDATE_BLOCKED'
           ? msg.errSelfUpdate
-          : sc?.error || 'Installation failed.';
+          : isLocked
+            ? formatLockedError(
+                isAlreadyDisabled ? msg.errFilesLockedDisabled : msg.errFilesLocked,
+                sc?.code,
+                sc?.error,
+              )
+            : sc?.error || 'Installation failed.';
       m.errorCode = sc?.code || 'INSTALL_FAILED';
     }
   } catch (err) {
@@ -370,30 +388,29 @@ async function handleReinstall(plugin: PluginItem) {
         workspacePath: state.workspacePath,
       },
     });
-    const sc = res.structuredContent as
-      | {
-          ok: boolean;
-          install?: InstallResultPayload;
-          inventory?: InventoryPayload;
-          error?: string;
-          code?: string;
-        }
-      | undefined;
+    const sc = res.structuredContent as InstallToolResponse | undefined;
     const t = getMessages(state.locale);
     if (sc?.ok) {
       if (sc.inventory) applyInventory(sc.inventory);
-      const toastLabel = sc.install?.restoredEnabled
-        ? t.toastUpdatedRestored
-        : sc.install?.wasEnabled === false && sc.install?.enabled === false
-          ? t.toastUpdatedKeptDisabled
-          : t.toastUpdated;
-      showToast('success', `${toastLabel}: ${plugin.displayName}`);
+      showToast('success', `${t.toastUpdated}: ${plugin.displayName}`);
     } else {
+      const isLocked = sc?.locked === true;
+      const isAlreadyDisabled =
+        typeof sc?.alreadyDisabled === 'boolean' ? sc.alreadyDisabled : plugin.enabled === false;
+      if (isLocked && !isAlreadyDisabled) {
+        state.manageGuideId = plugin.id;
+      }
       showToast(
         'error',
         sc?.code === 'SELF_UPDATE_BLOCKED'
           ? t.errSelfUpdate
-          : sc?.error || 'Failed to update plugin.',
+          : isLocked
+            ? formatLockedError(
+                isAlreadyDisabled ? t.errFilesLockedDisabled : t.errFilesLocked,
+                sc?.code,
+                sc?.error,
+              )
+            : sc?.error || 'Failed to update plugin.',
       );
     }
   } catch (err) {
@@ -404,57 +421,65 @@ async function handleReinstall(plugin: PluginItem) {
   }
 }
 
-async function handleToggleEnabled(plugin: PluginItem) {
-  if (state.busyPluginId) return;
-  state.busyPluginId = plugin.id;
-  render();
+function getCustomizationUri(plugin: PluginItem): string {
+  return plugin.customizationUri || `customization://${plugin.dir}`;
+}
 
-  const nextEnabled = !plugin.enabled;
+async function copyTextToClipboard(text: string): Promise<boolean> {
   try {
-    const res = await app.callServerTool({
-      name: 'app_set_plugin_enabled',
-      arguments: {
-        dir: plugin.dir,
-        scope: plugin.scope,
-        workspacePath: state.workspacePath,
-        enabled: nextEnabled,
-      },
-    });
-    const sc = res.structuredContent as
-      | {
-          ok: boolean;
-          enabled?: boolean;
-          inventory?: InventoryPayload;
-          error?: string;
-          code?: string;
-        }
-      | undefined;
-    const t = getMessages(state.locale);
-    if (sc?.ok) {
-      if (sc.inventory) {
-        applyInventory(sc.inventory);
-      } else {
-        await refreshInventory();
-      }
-      const effectiveEnabled = typeof sc.enabled === 'boolean' ? sc.enabled : nextEnabled;
-      showToast(
-        'success',
-        `${effectiveEnabled ? t.toastEnabled : t.toastDisabled}: ${plugin.displayName}`,
-      );
-    } else {
-      showToast(
-        'error',
-        sc?.code === 'SELF_DISABLE_BLOCKED'
-          ? t.errSelfDisable
-          : sc?.error || 'Failed to update plugin state.',
-      );
+    if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+      await navigator.clipboard.writeText(text);
+      return true;
     }
+  } catch {
+    // Fallback below
+  }
+  try {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.setAttribute('readonly', '');
+    ta.style.position = 'fixed';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.select();
+    const ok = document.execCommand('copy');
+    document.body.removeChild(ta);
+    return ok;
+  } catch {
+    return false;
+  }
+}
+
+async function handleCopyNativeLink(plugin: PluginItem) {
+  const t = getMessages(state.locale);
+  const uri = getCustomizationUri(plugin);
+  const copied = await copyTextToClipboard(uri);
+  if (copied) {
+    showToast('success', `${t.nativeManageCopied}: ${uri}`);
+  } else {
+    showToast('error', uri);
+  }
+  render();
+}
+
+async function handleSendNativeLink(plugin: PluginItem) {
+  if (!state.canSendMessage) return;
+  const t = getMessages(state.locale);
+  const uri = getCustomizationUri(plugin);
+  const prompt =
+    state.locale === 'zh'
+      ? `请给出插件 ${plugin.displayName} 的原生管理跳转链接 [${plugin.displayName}](${uri})，方便我在 Customizations 页面直接切换启用或禁用状态。`
+      : `Please provide the native Customizations link [${plugin.displayName}](${uri}) so I can toggle ${plugin.displayName} live.`;
+  try {
+    await app.sendMessage({
+      role: 'user',
+      content: [{ type: 'text', text: prompt }],
+    });
+    showToast('success', `${t.nativeManageSentChat}: ${plugin.displayName}`);
   } catch (err) {
     showToast('error', err instanceof Error ? err.message : String(err));
-  } finally {
-    state.busyPluginId = null;
-    render();
   }
+  render();
 }
 
 function getFilteredPlugins(): PluginItem[] {
@@ -498,9 +523,11 @@ const icons = {
 function renderPluginCard(p: PluginItem): string {
   const t = getMessages(state.locale);
   const expanded = state.expandedIds.has(p.id);
+  const managingNative = state.manageGuideId === p.id;
   const confirming = state.confirmUninstallId === p.id;
   const busy = state.busyPluginId === p.id;
   const initials = (p.displayName || p.name || '?').slice(0, 2).toUpperCase();
+  const customizationUri = getCustomizationUri(p);
 
   const sourceBadge = p.isBuiltin
     ? `<span class="badge">${esc(t.builtin)}</span>`
@@ -527,7 +554,6 @@ function renderPluginCard(p: PluginItem): string {
   if (p.components.sidecars?.length) chips.push(`${p.components.sidecars.length} ${t.sidecars}`);
 
   const sourceHint = p.installMeta?.displaySource || (p.isSymlink && p.linkTarget ? p.linkTarget : p.dir);
-  const toggleActionLabel = p.enabled ? t.disablePlugin : t.enablePlugin;
 
   return `
     <article class="plugin-card ${p.enabled ? '' : 'is-disabled'}" data-plugin-id="${esc(p.id)}">
@@ -544,22 +570,6 @@ function renderPluginCard(p: PluginItem): string {
           </div>
           ${p.description ? `<p class="card-desc">${esc(p.description)}</p>` : ''}
         </div>
-        <div class="card-toggle-wrap">
-          <button
-            type="button"
-            class="toggle-switch ${p.enabled ? 'is-enabled' : ''}"
-            role="switch"
-            aria-checked="${p.enabled ? 'true' : 'false'}"
-            aria-label="${esc(toggleActionLabel)}"
-            title="${esc(toggleActionLabel)}"
-            data-action="toggle-enabled"
-            data-id="${esc(p.id)}"
-            ${busy ? 'disabled' : ''}
-          >
-            <span class="toggle-track" aria-hidden="true"><span class="toggle-thumb"></span></span>
-            <span class="toggle-label">${esc(p.enabled ? t.enabled : t.disabled)}</span>
-          </button>
-        </div>
       </div>
 
       ${
@@ -572,11 +582,40 @@ function renderPluginCard(p: PluginItem): string {
       }
 
       ${
+        managingNative
+          ? `<div class="native-guide-box" data-native-guide="${esc(p.id)}">
+              <div class="native-guide-title">${esc(t.nativeManageTitle)}</div>
+              <p class="native-guide-desc">${esc(t.nativeManageDesc)}</p>
+              <div class="native-guide-uri-row">
+                <span class="native-guide-uri-label">${esc(t.nativeManageLinkLabel)}:</span>
+                <code class="native-guide-uri">${esc(customizationUri)}</code>
+              </div>
+              <div class="native-guide-actions">
+                <button type="button" class="btn btn-sm" data-action="copy-native-link" data-id="${esc(p.id)}">
+                  ${esc(t.nativeManageCopyLink)}
+                </button>
+                ${
+                  state.canSendMessage
+                    ? `<button type="button" class="btn btn-sm btn-primary" data-action="send-native-link" data-id="${esc(p.id)}">
+                        ${esc(t.nativeManageSendChat)}
+                      </button>`
+                    : ''
+                }
+              </div>
+            </div>`
+          : ''
+      }
+
+      ${
         expanded
           ? `<div class="card-details">
               <div class="detail-row">
                 <span class="detail-key">${esc(t.pathLabel)}</span>
                 <span class="detail-val">${esc(p.path)}</span>
+              </div>
+              <div class="detail-row">
+                <span class="detail-key">${esc(t.nativeManageLinkLabel)}</span>
+                <span class="detail-val">${esc(customizationUri)}</span>
               </div>
               ${
                 p.installMeta?.displaySource
@@ -617,6 +656,9 @@ function renderPluginCard(p: PluginItem): string {
       <div class="card-footer">
         <span class="card-source-hint" title="${esc(sourceHint)}">${esc(sourceHint)}</span>
         <div class="card-actions">
+          <button class="btn btn-ghost" data-action="toggle-manage-native" data-id="${esc(p.id)}">
+            ${esc(managingNative ? t.hideManageNative : t.manageNative)}
+          </button>
           <button class="btn btn-ghost" data-action="toggle-details" data-id="${esc(p.id)}">
             ${esc(expanded ? t.hideDetails : t.details)}
           </button>
@@ -1275,9 +1317,20 @@ function bindEvents() {
         if (plugin) void handleReinstall(plugin);
         break;
       }
-      case 'toggle-enabled': {
+      case 'toggle-manage-native': {
+        const id = actionEl.dataset.id || '';
+        state.manageGuideId = state.manageGuideId === id ? null : id;
+        render();
+        break;
+      }
+      case 'copy-native-link': {
         const plugin = state.plugins.find((p) => p.id === actionEl.dataset.id);
-        if (plugin) void handleToggleEnabled(plugin);
+        if (plugin) void handleCopyNativeLink(plugin);
+        break;
+      }
+      case 'send-native-link': {
+        const plugin = state.plugins.find((p) => p.id === actionEl.dataset.id);
+        if (plugin) void handleSendNativeLink(plugin);
         break;
       }
       case 'set-source-type':
@@ -1384,6 +1437,8 @@ async function bootstrap() {
   render();
   try {
     await app.connect();
+    const caps = app.getHostCapabilities();
+    state.canSendMessage = Boolean(caps?.message);
     applyHostContext(app.getHostContext());
     render();
     // If opened standalone without an immediate ontoolresult, proactively load inventory

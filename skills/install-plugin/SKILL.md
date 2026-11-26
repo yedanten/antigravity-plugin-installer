@@ -29,8 +29,8 @@ directory path.
      `workspacePath`).
    - Remind the user that newly installed plugins in `~/.gemini/config/plugins/`
      are discovered automatically by Antigravity without a restart, and can be
-     enabled or disabled directly from the **Plugin Installer** UI or the native
-     **Customizations** page using `[<name>](customization://<dir>)`.
+     enabled or disabled live on Antigravity's native **Customizations** page
+     using `[<name>](customization://<dir>)`.
 
 3. **Safety guardrails**:
    - Never suggest or run commands that manually hand-edit `~/.gemini/config/config.json`.

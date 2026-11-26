@@ -34,6 +34,7 @@ export interface InstallMeta {
 export interface PluginItem {
   id: string;
   dir: string;
+  customizationUri?: string;
   name: string;
   displayName: string;
   description: string;
@@ -87,12 +88,11 @@ export interface InstallStep {
 export interface InstallResultPayload {
   ok: boolean;
   overwrote?: boolean;
-  wasEnabled?: boolean;
-  autoDisabled?: boolean;
-  restoredEnabled?: boolean;
   enabled?: boolean;
+  replacementMode?: 'fresh' | 'replace' | 'in-place';
   plugin: {
     dir: string;
+    customizationUri?: string;
     name: string;
     displayName: string;
     version: string;
@@ -106,4 +106,16 @@ export interface InstallResultPayload {
     warnings: string[];
   };
   steps: InstallStep[];
+}
+
+export interface InstallToolResponse {
+  ok: boolean;
+  install?: InstallResultPayload;
+  inventory?: InventoryPayload;
+  error?: string;
+  code?: string;
+  locked?: boolean;
+  alreadyDisabled?: boolean;
+  customizationUri?: string | null;
+  existingDir?: string | null;
 }

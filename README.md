@@ -25,7 +25,7 @@ An Antigravity plugin powered by an integrated **MCP App** that lets you install
   - Local install modes: **Copy files** (isolated) or **Symlink / Junction** (macOS/Linux live dev link).
   - Collapsible format guide with one-click example insertion, branch/subdirectory fields, install scope selection (**Global** `~/.gemini/config/plugins` or **Workspace** `<workspace>/.agents/plugins`), and conflict overwrite protection.
 - **Installed Plugin Management**:
-  - View global, workspace, and built-in plugins with component badges (`Skills`, `MCP`, `Agents`, `Rules`, `Hooks`, `Sidecars`), manifest validation notices, an inline enable/disable switch (`config.json` atomic sync), one-click update/reinstall (auto-disables enabled plugins before replacing locked files and restores enabled state afterward), and safe uninstall (protects built-in plugins).
+  - View global, workspace, and built-in plugins with component badges (`Skills`, `MCP`, `Agents`, `Rules`, `Hooks`, `Sidecars`), manifest validation notices, read-only live status badges with direct guidance/jump links (`customization://<dir>`) to Antigravity's native **Customizations** page for real-time enable/disable (never hand-editing `config.json` behind the Language Server), atomic backup-and-swap update/reinstall with rollback protection, and safe uninstall (protects built-in plugins and itself).
 - **Zero Runtime Dependencies**:
   - The MCP server runs purely on Node.js (`>= 18.18.0`) built-in modules, so cloning or installing the plugin works out of the box without running `npm install`.
 
@@ -70,7 +70,7 @@ Antigravity automatically discovers newly added plugins without a restart.
 1. **Sidebar / Auxiliary Pane**: Click **Plugin Installer** in the Antigravity App left sidebar (or open it from the side pane `+` menu).
 2. **Install a Plugin**: Click **`+ Install Plugin`** at the top right, paste a GitHub URL, npm package name, or local directory path, adjust options if needed, and click **Install Plugin**.
 3. **Slash Command / Chat**: Invoke `/install-plugin` in chat or ask the agent to open the Plugin Installer or install a specific plugin URL directly.
-4. **Enable / Disable Plugins**: Newly installed plugins are enabled by default and hot-discovered by Antigravity. Use the toggle switch on any plugin card in **Plugin Installer** (or Antigravity's native **Customizations** page) to enable or disable it.
+4. **Enable / Disable Plugins**: Newly installed plugins are enabled by default and hot-discovered by Antigravity. Because Antigravity's Language Server manages live reload for MCP servers, sidecars, hooks, and rules, use Antigravity's native **Customizations > Installed** page to enable or disable plugins live (click **Enable / Disable** on any card in **Plugin Installer** for the plugin's `customization://<dir>` link and quick chat jump).
 
 ## Configuration
 
@@ -81,7 +81,7 @@ The bundled MCP server (`mcp_config.json`) requires no secrets or manual configu
 | `ANTIGRAVITY_PLUGINS_DIR` | Override the default global plugins directory (`~/.gemini/config/plugins`). |
 | `ANTIGRAVITY_BUILTIN_PLUGINS_DIR` | Override the built-in plugins directory scanned as read-only. |
 | `ANTIGRAVITY_APP_DATA_DIR` | Override the Antigravity app data root (used to resolve `builtin/plugins` fallback). |
-| `ANTIGRAVITY_CONFIG_PATH` | Override the Antigravity `config.json` path used for plugin enable/disable state. |
+| `ANTIGRAVITY_CONFIG_PATH` | Override the Antigravity `config.json` path read (read-only) to display plugin enable/disable status. |
 | `PLUGIN_INSTALLER_APP_HTML` | Point to a custom HTML file path for rapid UI iteration. |
 
 ## Development & Building

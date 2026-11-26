@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
+import { watch as fsWatch } from 'node:fs';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -19,7 +20,6 @@ import {
   listInstalledPlugins,
   readAntigravityConfig,
   resolveAgyPath,
-  setPluginEnabled,
   uninstallPlugin,
   validatePluginDirName,
 } from '../server/plugins.mjs';
@@ -417,61 +417,78 @@ test('R1: v2.35.1 validator rules, .gemini-plugin discovery, sidecars, BOM/JSONC
   }
 });
 
-test('R2: setPluginEnabled atomically serializes writes, preserves sibling config keys, and validates dirName', async () => {
+test('R2: config.json is read-only (BOM/JSONC/dir-keyed), never mutated, and validatePluginDirName guards invalid names', async () => {
   const sandbox = await fs.mkdtemp(path.join(os.tmpdir(), 'agy-r2-config-'));
   const prevConfig = process.env.ANTIGRAVITY_CONFIG_PATH;
+  const prevPluginsDir = process.env.ANTIGRAVITY_PLUGINS_DIR;
+  const prevBuiltinDir = process.env.ANTIGRAVITY_BUILTIN_PLUGINS_DIR;
 
   try {
     const configPath = path.join(sandbox, 'config.json');
+    const pluginsDir = path.join(sandbox, 'plugins');
+    const builtinDir = path.join(sandbox, 'builtin');
     process.env.ANTIGRAVITY_CONFIG_PATH = configPath;
+    process.env.ANTIGRAVITY_PLUGINS_DIR = pluginsDir;
+    process.env.ANTIGRAVITY_BUILTIN_PLUGINS_DIR = builtinDir;
     assert.equal(getConfigPath(), path.resolve(configPath));
 
+    await fs.mkdir(path.join(pluginsDir, 'dir-slug'), { recursive: true });
     await fs.writeFile(
-      configPath,
-      `\uFEFF// BOM + JSONC config\n${JSON.stringify(
-        {
-          userSettings: { theme: 'dark', telemetry: false },
-          sidecars: { inspector: { port: 9123 } },
-          plugins: {
-            'other-plugin': { enabled: true, customFlag: 'keep' },
-            'dir-slug': { enabled: true, note: 'existing' },
-          },
-        },
-        null,
-        2,
-      )}`,
-      'utf8',
+      path.join(pluginsDir, 'dir-slug', 'plugin.json'),
+      JSON.stringify({ name: 'manifest-slug', displayName: 'Dir Slug', version: '1.0.0' }),
+    );
+    await fs.mkdir(path.join(pluginsDir, 'My_Custom.Plugin'), { recursive: true });
+    await fs.writeFile(
+      path.join(pluginsDir, 'My_Custom.Plugin', 'plugin.json'),
+      JSON.stringify({ name: 'my-custom', displayName: 'My Custom', version: '1.0.0' }),
     );
 
-    // Concurrent updates to different plugins must both persist cleanly
-    const [r1, r2] = await Promise.all([
-      setPluginEnabled('dir-slug', false),
-      setPluginEnabled('second-plugin', true),
-    ]);
-    assert.equal(r1.dir, 'dir-slug');
-    assert.equal(r1.enabled, false);
-    assert.equal(r1.previousEnabled, true);
-    assert.equal(r2.dir, 'second-plugin');
-    assert.equal(r2.enabled, true);
+    const originalRaw = `\uFEFF// BOM + JSONC config\n${JSON.stringify(
+      {
+        userSettings: { theme: 'dark', telemetry: false },
+        sidecars: { inspector: { port: 9123 } },
+        plugins: {
+          'dir-slug': { enabled: false, note: 'existing' },
+          'My_Custom.Plugin': { enabled: true },
+        },
+      },
+      null,
+      2,
+    )}`;
+    await fs.writeFile(configPath, originalRaw, 'utf8');
 
-    const updated = await readAntigravityConfig();
-    assert.deepEqual(updated.userSettings, { theme: 'dark', telemetry: false });
-    assert.deepEqual(updated.sidecars, { inspector: { port: 9123 } });
-    assert.deepEqual(updated.plugins['other-plugin'], { enabled: true, customFlag: 'keep' });
-    assert.deepEqual(updated.plugins['dir-slug'], { enabled: false, note: 'existing' });
-    assert.deepEqual(updated.plugins['second-plugin'], { enabled: true });
+    const cfg = await readAntigravityConfig();
+    assert.deepEqual(cfg.userSettings, { theme: 'dark', telemetry: false });
+    assert.deepEqual(cfg.sidecars, { inspector: { port: 9123 } });
+    assert.equal(cfg.plugins['dir-slug'].enabled, false);
 
-    // Reject path traversal / invalid dirName
-    await assert.rejects(() => setPluginEnabled('../evil', true), /Invalid plugin directory name/);
-    await assert.rejects(() => setPluginEnabled('bad/dir', true), /Invalid plugin directory name/);
+    const inv = await listInstalledPlugins({});
+    const dirSlug = inv.plugins.find((p) => p.dir === 'dir-slug');
+    const customDir = inv.plugins.find((p) => p.dir === 'My_Custom.Plugin');
+    assert.equal(dirSlug.enabled, false);
+    assert.equal(dirSlug.customizationUri, 'customization://dir-slug');
+    assert.equal(customDir.enabled, true);
+    assert.equal(customDir.customizationUri, 'customization://My_Custom.Plugin');
+
+    // config.json must remain byte-for-byte untouched
+    assert.equal(await fs.readFile(configPath, 'utf8'), originalRaw);
+
+    // Unsafe names remain rejected
+    for (const badName of ['', '   ', ' bad ', '.', '..', '../evil', 'a/b', 'a\\b', 'a\0b', 'a\nb', '__proto__', 'constructor', 'prototype']) {
+      assert.throws(() => validatePluginDirName(badName), /Invalid plugin directory name/);
+    }
   } finally {
     if (prevConfig === undefined) delete process.env.ANTIGRAVITY_CONFIG_PATH;
     else process.env.ANTIGRAVITY_CONFIG_PATH = prevConfig;
+    if (prevPluginsDir === undefined) delete process.env.ANTIGRAVITY_PLUGINS_DIR;
+    else process.env.ANTIGRAVITY_PLUGINS_DIR = prevPluginsDir;
+    if (prevBuiltinDir === undefined) delete process.env.ANTIGRAVITY_BUILTIN_PLUGINS_DIR;
+    else process.env.ANTIGRAVITY_BUILTIN_PLUGINS_DIR = prevBuiltinDir;
     await fs.rm(sandbox, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
-test('R2 + R3: MCP stdio app_set_plugin_enabled & app_reinstall_plugin preserve state across dir!=name and scopes', async () => {
+test('R2 + R3: MCP stdio does not expose app_set_plugin_enabled and app_reinstall_plugin preserves config.json byte-for-byte', async () => {
   const sandbox = await fs.mkdtemp(path.join(os.tmpdir(), 'agy-mcp-r2-r3-'));
   const pluginsDir = path.join(sandbox, 'plugins');
   const builtinDir = path.join(sandbox, 'builtin');
@@ -487,10 +504,16 @@ test('R2 + R3: MCP stdio app_set_plugin_enabled & app_reinstall_plugin preserve 
     path.join(srcDir, 'plugin.json'),
     JSON.stringify({ name: 'manifest-slug', displayName: 'Dir Mismatch Plugin', version: '1.0.0' }),
   );
-  await fs.writeFile(
-    configPath,
-    JSON.stringify({ userSettings: { locale: 'zh-CN' }, sidecars: { keep: true }, plugins: {} }),
+  const initialConfig = JSON.stringify(
+    {
+      userSettings: { locale: 'zh-CN' },
+      sidecars: { keep: true },
+      plugins: { 'dir-slug': { enabled: false }, 'builtin-tool': { enabled: false } },
+    },
+    null,
+    2,
   );
+  await fs.writeFile(configPath, initialConfig, 'utf8');
 
   const child = spawn(process.execPath, [path.join(REPO_ROOT, 'server', 'index.mjs'), '--data-dir', dataDir], {
     stdio: ['pipe', 'pipe', 'pipe'],
@@ -534,79 +557,46 @@ test('R2 + R3: MCP stdio app_set_plugin_enabled & app_reinstall_plugin preserve 
   try {
     await rpc(1, 'initialize', { protocolVersion: '2025-11-25', capabilities: {}, clientInfo: { name: 'test', version: '1.0' } });
 
+    const toolsList = await rpc(2, 'tools/list');
+    assert.equal(
+      toolsList.result.tools.some((t) => t.name === 'app_set_plugin_enabled'),
+      false,
+      'app_set_plugin_enabled must not be registered',
+    );
+
     // Install with targetDirName !== manifest.name
-    const inst = await rpc(2, 'tools/call', {
+    const inst = await rpc(3, 'tools/call', {
       name: 'app_install_plugin',
       arguments: { source: srcDir, targetDirName: 'dir-slug', scope: 'global' },
     });
     assert.equal(inst.result.structuredContent.ok, true);
+    assert.equal(inst.result.structuredContent.install.plugin.customizationUri, 'customization://dir-slug');
 
-    // Disable dir-slug via app_set_plugin_enabled
-    const dis = await rpc(3, 'tools/call', {
-      name: 'app_set_plugin_enabled',
-      arguments: { dir: 'dir-slug', scope: 'global', enabled: false },
-    });
-    assert.equal(dis.result.structuredContent.ok, true);
-    assert.equal(dis.result.structuredContent.enabled, false);
-    const listedAfterDis = dis.result.structuredContent.inventory.plugins.find((p) => p.dir === 'dir-slug');
-    assert.equal(listedAfterDis.enabled, false);
-
-    // Verify app_list_plugins reflects disabled state & config.json keyed by dir-slug (not manifest-slug)
+    // Verify app_list_plugins reflects disabled state from config.json keyed by dir-slug
     const listRes = await rpc(4, 'tools/call', { name: 'app_list_plugins', arguments: {} });
-    assert.equal(listRes.result.structuredContent.plugins.find((p) => p.dir === 'dir-slug').enabled, false);
-    const rawCfg = JSON.parse(await fs.readFile(configPath, 'utf8'));
-    assert.equal(rawCfg.plugins['dir-slug'].enabled, false);
-    assert.equal(rawCfg.plugins['manifest-slug'], undefined);
-    assert.deepEqual(rawCfg.userSettings, { locale: 'zh-CN' });
+    const dirSlugCard = listRes.result.structuredContent.plugins.find((p) => p.dir === 'dir-slug');
+    assert.equal(dirSlugCard.enabled, false);
+    assert.equal(dirSlugCard.customizationUri, 'customization://dir-slug');
+    const builtinCard = listRes.result.structuredContent.plugins.find((p) => p.dir === 'builtin-tool');
+    assert.equal(builtinCard.enabled, false);
+    assert.equal(builtinCard.customizationUri, 'customization://builtin-tool');
 
-    // Toggle builtin plugin too
-    const toggleBuiltin = await rpc(5, 'tools/call', {
-      name: 'app_set_plugin_enabled',
-      arguments: { dir: 'builtin-tool', scope: 'builtin', enabled: false },
-    });
-    assert.equal(toggleBuiltin.result.structuredContent.ok, true);
-    assert.equal(
-      toggleBuiltin.result.structuredContent.inventory.plugins.find((p) => p.dir === 'builtin-tool').enabled,
-      false,
-    );
-
-    // Reinstall disabled plugin -> stays disabled
+    // Reinstall disabled plugin -> updates version and never touches config.json
     await fs.writeFile(
       path.join(srcDir, 'plugin.json'),
       JSON.stringify({ name: 'manifest-slug', displayName: 'Dir Mismatch Plugin', version: '1.1.0' }),
     );
-    const reinstDisabled = await rpc(6, 'tools/call', {
+    const reinst = await rpc(5, 'tools/call', {
       name: 'app_reinstall_plugin',
       arguments: { dir: 'dir-slug', scope: 'global' },
     });
-    assert.equal(reinstDisabled.result.structuredContent.ok, true);
-    assert.equal(reinstDisabled.result.structuredContent.install.wasEnabled, false);
-    assert.equal(reinstDisabled.result.structuredContent.install.restoredEnabled, false);
-    assert.equal(
-      reinstDisabled.result.structuredContent.inventory.plugins.find((p) => p.dir === 'dir-slug').enabled,
-      false,
-    );
+    assert.equal(reinst.result.structuredContent.ok, true);
+    const updatedCard = reinst.result.structuredContent.inventory.plugins.find((p) => p.dir === 'dir-slug');
+    assert.equal(updatedCard.version, '1.1.0');
+    assert.equal(updatedCard.enabled, false);
 
-    // Re-enable, then reinstall -> auto-disables and restores enabled: true
-    await rpc(7, 'tools/call', {
-      name: 'app_set_plugin_enabled',
-      arguments: { dir: 'dir-slug', scope: 'global', enabled: true },
-    });
-    await fs.writeFile(
-      path.join(srcDir, 'plugin.json'),
-      JSON.stringify({ name: 'manifest-slug', displayName: 'Dir Mismatch Plugin', version: '1.2.0' }),
-    );
-    const reinstEnabled = await rpc(8, 'tools/call', {
-      name: 'app_reinstall_plugin',
-      arguments: { dir: 'dir-slug', scope: 'global' },
-    });
-    assert.equal(reinstEnabled.result.structuredContent.ok, true);
-    assert.equal(reinstEnabled.result.structuredContent.install.wasEnabled, true);
-    assert.equal(reinstEnabled.result.structuredContent.install.autoDisabled, true);
-    assert.equal(reinstEnabled.result.structuredContent.install.restoredEnabled, true);
-    const updatedCard = reinstEnabled.result.structuredContent.inventory.plugins.find((p) => p.dir === 'dir-slug');
-    assert.equal(updatedCard.version, '1.2.0');
-    assert.equal(updatedCard.enabled, true);
+    // config.json must still be byte-for-byte identical
+    assert.equal(await fs.readFile(configPath, 'utf8'), initialConfig);
   } finally {
     const exitPromise = new Promise((resolve) => {
       if (child.exitCode !== null || child.signalCode !== null) {
@@ -623,7 +613,7 @@ test('R2 + R3: MCP stdio app_set_plugin_enabled & app_reinstall_plugin preserve 
   }
 });
 
-test('R3: installPlugin auto-disables before removal with EBUSY retry, restores enabled state, and guards failures', async () => {
+test('R3: installPlugin retries transient EBUSY without modifying config.json and gives actionable lock guidance on persistent locks', async () => {
   const sandbox = await fs.mkdtemp(path.join(os.tmpdir(), 'agy-r3-update-'));
   const prevPluginsDir = process.env.ANTIGRAVITY_PLUGINS_DIR;
   const prevConfigPath = process.env.ANTIGRAVITY_CONFIG_PATH;
@@ -637,31 +627,24 @@ test('R3: installPlugin auto-disables before removal with EBUSY retry, restores 
 
     await fs.mkdir(srcDir, { recursive: true });
     await fs.writeFile(path.join(srcDir, 'plugin.json'), '{"name":"lock-demo","version":"1.0.0"}');
-    await fs.writeFile(configPath, '{"plugins":{}}', 'utf8');
+    const initialConfig = '{"plugins":{"lock-demo":{"enabled":true}},"userSettings":{"theme":"dark"}}';
+    await fs.writeFile(configPath, initialConfig, 'utf8');
 
-    // Initial install (enabled by default)
+    // Initial install
     await installPlugin({ source: srcDir, scope: 'global' });
 
-    // 1. Overwrite enabled plugin while simulating transient EBUSY lock on removal
+    // 1. Overwrite plugin while simulating transient EBUSY lock on removal (config.json untouched)
     await fs.writeFile(path.join(srcDir, 'plugin.json'), '{"name":"lock-demo","version":"2.0.0"}');
-    const timeline = [];
     let rmAttempts = 0;
 
     const resOk = await installPlugin({
       source: srcDir,
       scope: 'global',
       overwrite: true,
-      disableSettleMs: 0,
       removeRetries: 4,
       removeRetryDelayMs: 5,
-      setPluginEnabled: async (dir, enabled) => {
-        timeline.push(`set:${dir}:${enabled}`);
-        return setPluginEnabled(dir, enabled);
-      },
       removeTarget: async (destPath, { attempt }) => {
         rmAttempts = attempt;
-        const cfgDuringRm = await readAntigravityConfig();
-        timeline.push(`rm:${attempt}:enabled=${cfgDuringRm.plugins['lock-demo']?.enabled}`);
         if (attempt < 3) {
           const e = new Error('EBUSY: resource busy or locked');
           e.code = 'EBUSY';
@@ -672,21 +655,12 @@ test('R3: installPlugin auto-disables before removal with EBUSY retry, restores 
     });
 
     assert.equal(rmAttempts, 3);
-    assert.equal(resOk.wasEnabled, true);
-    assert.equal(resOk.autoDisabled, true);
-    assert.equal(resOk.restoredEnabled, true);
+    assert.equal(resOk.ok, true);
+    assert.equal(resOk.overwrote, true);
     assert.equal(resOk.enabled, true);
-    assert.deepEqual(timeline, [
-      'set:lock-demo:false',
-      'rm:1:enabled=false',
-      'rm:2:enabled=false',
-      'rm:3:enabled=false',
-      'set:lock-demo:true',
-    ]);
-    const finalCfg = await readAntigravityConfig();
-    assert.equal(finalCfg.plugins['lock-demo'].enabled, true);
+    assert.equal(await fs.readFile(configPath, 'utf8'), initialConfig);
 
-    // 2. Failed source validation never disables the live enabled plugin
+    // 2. Failed source validation never touches existing files or config.json
     const brokenSrc = path.join(sandbox, 'broken-src');
     await fs.mkdir(brokenSrc, { recursive: true });
     await fs.writeFile(path.join(brokenSrc, 'plugin.json'), '{bad json');
@@ -697,21 +671,18 @@ test('R3: installPlugin auto-disables before removal with EBUSY retry, restores 
           targetDirName: 'lock-demo',
           scope: 'global',
           overwrite: true,
-          disableSettleMs: 0,
         }),
       /Invalid JSON/,
     );
-    const cfgAfterBadSource = await readAntigravityConfig();
-    assert.equal(cfgAfterBadSource.plugins['lock-demo'].enabled, true);
+    assert.equal(await fs.readFile(configPath, 'utf8'), initialConfig);
 
-    // 3. Persistent EBUSY failure rolls back enabled state if target still exists intact
+    // 3. Persistent EBUSY failure reports locked=true + customizationUri guidance without mutating config.json
     await assert.rejects(
       () =>
         installPlugin({
           source: srcDir,
           scope: 'global',
           overwrite: true,
-          disableSettleMs: 0,
           removeRetries: 1,
           removeRetryDelayMs: 5,
           removeTarget: async () => {
@@ -720,43 +691,17 @@ test('R3: installPlugin auto-disables before removal with EBUSY retry, restores 
             throw e;
           },
         }),
-      /files are locked \(EBUSY\)/,
-    );
-    const cfgAfterLockFail = await readAntigravityConfig();
-    assert.equal(cfgAfterLockFail.plugins['lock-demo'].enabled, true);
-
-    // 4. Updating a disabled plugin (including one originally disabled via manifest) keeps it disabled
-    const manifestDisabledSrc = path.join(sandbox, 'manifest-disabled');
-    await fs.mkdir(manifestDisabledSrc, { recursive: true });
-    await fs.writeFile(
-      path.join(manifestDisabledSrc, 'plugin.json'),
-      '{"name":"quiet-plugin","version":"1.0.0","disabled":true}',
-    );
-    await installPlugin({ source: manifestDisabledSrc, scope: 'global' });
-
-    // New version omits "disabled": true, yet update must keep it disabled
-    await fs.writeFile(
-      path.join(manifestDisabledSrc, 'plugin.json'),
-      '{"name":"quiet-plugin","version":"2.0.0"}',
-    );
-    const disabledCalls = [];
-    const resDisabled = await installPlugin({
-      source: manifestDisabledSrc,
-      scope: 'global',
-      overwrite: true,
-      disableSettleMs: 0,
-      setPluginEnabled: async (dir, enabled) => {
-        disabledCalls.push({ dir, enabled });
-        return setPluginEnabled(dir, enabled);
+      (err) => {
+        assert.match(err.message, /files are locked \(EBUSY\)/);
+        assert.match(err.message, /customization:\/\/lock-demo/);
+        assert.equal(err.locked, true);
+        assert.equal(err.customizationUri, 'customization://lock-demo');
+        return true;
       },
-    });
-    assert.equal(resDisabled.wasEnabled, false);
-    assert.equal(resDisabled.autoDisabled, false);
-    assert.equal(resDisabled.restoredEnabled, false);
-    assert.equal(resDisabled.enabled, false);
-    assert.ok(!disabledCalls.some((c) => c.enabled === true));
+    );
+    assert.equal(await fs.readFile(configPath, 'utf8'), initialConfig);
 
-    // 5. Live self-overwrite guard blocks replacing running pluginRoot
+    // 4. Live self-overwrite guard blocks replacing running pluginRoot
     await assert.rejects(
       () =>
         installPlugin({
@@ -874,13 +819,12 @@ test('R3 hardening: atomic backup/swap keeps files intact on permanent lock and 
       );
     }
 
-    // All existing files in destPath must remain 100% intact and enabled rolled back to true
+    // All existing files in destPath must remain 100% intact and config.json untouched
     assert.equal(await fs.readFile(path.join(destPath, 'aaa-first.txt'), 'utf8'), 'keep-me-v1');
     const manifestAfterLock = JSON.parse(await fs.readFile(path.join(destPath, 'plugin.json'), 'utf8'));
     assert.equal(manifestAfterLock.version, '1.0.0');
     assert.equal((await fs.lstat(lockedFile)).isFile(), true);
-    const cfgAfterLock = await readAntigravityConfig();
-    assert.equal(cfgAfterLock.plugins['perm-lock-demo'].enabled, true);
+    assert.equal(await fs.readFile(configPath, 'utf8'), '{"plugins":{}}');
 
     // Release the Windows file lock and confirm locked file content was also untouched
     if (lockerProc) {
@@ -901,14 +845,13 @@ test('R3 hardening: atomic backup/swap keeps files intact on permanent lock and 
     }
     assert.equal(await fs.readFile(lockedFile, 'utf8'), 'locked-content');
 
-    // Post-backup failure (after rename succeeded and v2 was copied) must restore v1 + enabled: true
+    // Post-backup failure (after rename succeeded and v2 was copied) must restore v1 without touching config.json
     await assert.rejects(
       () =>
         installPlugin({
           source: srcV2,
           scope: 'global',
           overwrite: true,
-          disableSettleMs: 0,
           installRegistry: {
             record: async () => {
               throw new Error('Simulated registry failure');
@@ -921,21 +864,20 @@ test('R3 hardening: atomic backup/swap keeps files intact on permanent lock and 
     const manifestAfterRollback = JSON.parse(await fs.readFile(path.join(destPath, 'plugin.json'), 'utf8'));
     assert.equal(manifestAfterRollback.version, '1.0.0');
     assert.equal(await fs.readFile(path.join(destPath, 'aaa-first.txt'), 'utf8'), 'keep-me-v1');
-    const cfgAfterRollback = await readAntigravityConfig();
-    assert.equal(cfgAfterRollback.plugins['perm-lock-demo'].enabled, true);
+    assert.equal(await fs.readFile(configPath, 'utf8'), '{"plugins":{}}');
     const entriesAfterRollback = await fs.readdir(pluginsDir);
     assert.deepEqual(entriesAfterRollback, ['perm-lock-demo']);
 
-    // Unlocked update succeeds and cleans up backup directory
+    // Unlocked update succeeds and cleans up backup directory without touching config.json
     const resSuccess = await installPlugin({
       source: srcV2,
       scope: 'global',
       overwrite: true,
-      disableSettleMs: 0,
     });
     assert.equal(resSuccess.ok, true);
     assert.equal(resSuccess.overwrote, true);
-    assert.equal(resSuccess.restoredEnabled, true);
+    assert.equal(resSuccess.enabled, true);
+    assert.equal(await fs.readFile(configPath, 'utf8'), '{"plugins":{}}');
     const manifestV2 = JSON.parse(await fs.readFile(path.join(destPath, 'plugin.json'), 'utf8'));
     assert.equal(manifestV2.version, '2.0.0');
     const entriesAfterSuccess = await fs.readdir(pluginsDir);
@@ -952,7 +894,7 @@ test('R3 hardening: atomic backup/swap keeps files intact on permanent lock and 
   }
 });
 
-test('R2 + R3 hardening: SELF_DISABLE_BLOCKED, SELF_UPDATE_BLOCKED, and SELF_UNINSTALL_BLOCKED catch symlinks/junctions and case mismatches', async () => {
+test('R3 hardening: SELF_UPDATE_BLOCKED and SELF_UNINSTALL_BLOCKED catch symlinks/junctions and case mismatches', async () => {
   const sandbox = await fs.mkdtemp(path.join(os.tmpdir(), 'agy-self-guard-'));
   const prevPluginsDir = process.env.ANTIGRAVITY_PLUGINS_DIR;
   const prevConfigPath = process.env.ANTIGRAVITY_CONFIG_PATH;
@@ -1080,14 +1022,8 @@ test('R2 + R3 hardening: SELF_DISABLE_BLOCKED, SELF_UPDATE_BLOCKED, and SELF_UNI
       });
 
     await rpc(1, 'initialize', { protocolVersion: '2025-11-25', capabilities: {}, clientInfo: { name: 'test', version: '1.0' } });
-    const disRes = await rpc(2, 'tools/call', {
-      name: 'app_set_plugin_enabled',
-      arguments: { dir: 'plugin-installer', scope: 'global', enabled: false },
-    });
-    assert.equal(disRes.result.structuredContent.ok, false);
-    assert.equal(disRes.result.structuredContent.code, 'SELF_DISABLE_BLOCKED');
 
-    const uninstRes = await rpc(3, 'tools/call', {
+    const uninstRes = await rpc(2, 'tools/call', {
       name: 'app_uninstall_plugin',
       arguments: { dir: 'plugin-installer', scope: 'global' },
     });
@@ -1117,116 +1053,7 @@ test('R2 + R3 hardening: SELF_DISABLE_BLOCKED, SELF_UPDATE_BLOCKED, and SELF_UNI
   }
 });
 
-test('R2 hardening: setPluginEnabled and app_set_plugin_enabled allow toggling existing non-kebab plugin directories', async () => {
-  const sandbox = await fs.mkdtemp(path.join(os.tmpdir(), 'agy-non-kebab-'));
-  const prevPluginsDir = process.env.ANTIGRAVITY_PLUGINS_DIR;
-  const prevConfigPath = process.env.ANTIGRAVITY_CONFIG_PATH;
-  let child = null;
-
-  try {
-    const pluginsDir = path.join(sandbox, 'plugins');
-    const builtinDir = path.join(sandbox, 'builtin');
-    const dataDir = path.join(sandbox, 'data');
-    const configPath = path.join(sandbox, 'config.json');
-    const customDir = path.join(pluginsDir, 'My_Custom.Plugin');
-
-    process.env.ANTIGRAVITY_PLUGINS_DIR = pluginsDir;
-    process.env.ANTIGRAVITY_CONFIG_PATH = configPath;
-
-    await fs.mkdir(customDir, { recursive: true });
-    await fs.mkdir(builtinDir, { recursive: true });
-    await fs.writeFile(
-      path.join(customDir, 'plugin.json'),
-      JSON.stringify({ name: 'my-custom', displayName: 'My Custom Plugin', version: '1.0.0' }),
-    );
-    await fs.writeFile(configPath, '{"plugins":{}}', 'utf8');
-
-    // Direct setPluginEnabled works on non-kebab directory names
-    const r1 = await setPluginEnabled('My_Custom.Plugin', false);
-    assert.equal(r1.dir, 'My_Custom.Plugin');
-    assert.equal(r1.enabled, false);
-    const r2 = await setPluginEnabled('My_Custom.Plugin', true);
-    assert.equal(r2.enabled, true);
-
-    // Unsafe names remain rejected
-    for (const badName of ['', '   ', ' My_Custom.Plugin ', '.', '..', 'a/b', 'a\\b', 'a\0b', 'a\nb', '__proto__', 'constructor', 'prototype']) {
-      assert.throws(() => validatePluginDirName(badName), /Invalid plugin directory name/);
-    }
-
-    // MCP app_set_plugin_enabled toggles My_Custom.Plugin cleanly
-    child = spawn(process.execPath, [path.join(REPO_ROOT, 'server', 'index.mjs'), '--data-dir', dataDir], {
-      stdio: ['pipe', 'pipe', 'pipe'],
-      env: {
-        ...process.env,
-        ANTIGRAVITY_PLUGINS_DIR: pluginsDir,
-        ANTIGRAVITY_BUILTIN_PLUGINS_DIR: builtinDir,
-        ANTIGRAVITY_CONFIG_PATH: configPath,
-      },
-    });
-
-    let stdoutBuf = '';
-    const pending = new Map();
-    child.stdout.setEncoding('utf8');
-    child.stdout.on('data', (chunk) => {
-      stdoutBuf += chunk;
-      let idx;
-      while ((idx = stdoutBuf.indexOf('\n')) !== -1) {
-        const line = stdoutBuf.slice(0, idx).trim();
-        stdoutBuf = stdoutBuf.slice(idx + 1);
-        if (!line) continue;
-        const msg = JSON.parse(line);
-        const resolver = pending.get(msg.id);
-        if (resolver) {
-          pending.delete(msg.id);
-          resolver(msg);
-        }
-      }
-    });
-
-    const rpc = (id, method, params = {}) =>
-      new Promise((resolve, reject) => {
-        const timer = setTimeout(() => reject(new Error(`Timeout waiting for ${method}`)), 8000);
-        pending.set(id, (msg) => {
-          clearTimeout(timer);
-          resolve(msg);
-        });
-        child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id, method, params })}\n`);
-      });
-
-    await rpc(1, 'initialize', { protocolVersion: '2025-11-25', capabilities: {}, clientInfo: { name: 'test', version: '1.0' } });
-    const toggleRes = await rpc(2, 'tools/call', {
-      name: 'app_set_plugin_enabled',
-      arguments: { dir: 'My_Custom.Plugin', scope: 'global', enabled: false },
-    });
-    assert.equal(toggleRes.result.structuredContent.ok, true);
-    assert.equal(toggleRes.result.structuredContent.dir, 'My_Custom.Plugin');
-    assert.equal(toggleRes.result.structuredContent.enabled, false);
-    const listed = toggleRes.result.structuredContent.inventory.plugins.find((p) => p.dir === 'My_Custom.Plugin');
-    assert.ok(listed);
-    assert.equal(listed.enabled, false);
-  } finally {
-    if (child) {
-      const exitPromise = new Promise((resolve) => {
-        if (child.exitCode !== null || child.signalCode !== null) {
-          resolve();
-          return;
-        }
-        child.once('close', resolve);
-        setTimeout(resolve, 1000);
-      });
-      child.stdin.end();
-      child.kill();
-      await exitPromise;
-    }
-    if (prevPluginsDir === undefined) delete process.env.ANTIGRAVITY_PLUGINS_DIR;
-    else process.env.ANTIGRAVITY_PLUGINS_DIR = prevPluginsDir;
-    if (prevConfigPath === undefined) delete process.env.ANTIGRAVITY_CONFIG_PATH;
-    else process.env.ANTIGRAVITY_CONFIG_PATH = prevConfigPath;
-    await fs.rm(sandbox, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
-  }
-});
-
-test('R3 hardening: symlink/junction overwrite with mode=copy failing mid-copy removes partial dir and restores junction + enabled state', async () => {
+test('R3 hardening: symlink/junction overwrite with mode=copy failing mid-copy removes partial dir and restores junction without touching config.json', async () => {
   const sandbox = await fs.mkdtemp(path.join(os.tmpdir(), 'agy-link-copy-rollback-'));
   const prevPluginsDir = process.env.ANTIGRAVITY_PLUGINS_DIR;
   const prevConfigPath = process.env.ANTIGRAVITY_CONFIG_PATH;
@@ -1257,7 +1084,8 @@ test('R3 hardening: symlink/junction overwrite with mode=copy failing mid-copy r
     );
     const v2LockedFile = path.join(srcV2, 'zzz-locked.txt');
     await fs.writeFile(v2LockedFile, 'locked-v2-source', 'utf8');
-    await fs.writeFile(configPath, '{"plugins":{}}', 'utf8');
+    const initialConfig = '{"plugins":{"link-rollback":{"enabled":true}}}';
+    await fs.writeFile(configPath, initialConfig, 'utf8');
 
     const registry = new InstallRegistry(dataDir);
     await installPlugin({
@@ -1267,7 +1095,6 @@ test('R3 hardening: symlink/junction overwrite with mode=copy failing mid-copy r
       scope: 'global',
       installRegistry: registry,
     });
-    await setPluginEnabled('link-rollback', true);
 
     const destPath = path.join(pluginsDir, 'link-rollback');
     assert.equal((await fs.lstat(destPath)).isSymbolicLink(), true);
@@ -1311,7 +1138,6 @@ test('R3 hardening: symlink/junction overwrite with mode=copy failing mid-copy r
           mode: 'copy',
           scope: 'global',
           overwrite: true,
-          disableSettleMs: 0,
           installRegistry: registry,
         }),
       );
@@ -1323,7 +1149,6 @@ test('R3 hardening: symlink/junction overwrite with mode=copy failing mid-copy r
           mode: 'copy',
           scope: 'global',
           overwrite: true,
-          disableSettleMs: 0,
           installRegistry: {
             record: async () => {
               throw new Error('Simulated registry failure');
@@ -1333,7 +1158,7 @@ test('R3 hardening: symlink/junction overwrite with mode=copy failing mid-copy r
       );
     }
 
-    // Partial copy must be gone and original junction -> srcV1 + enabled: true restored
+    // Partial copy must be gone and original junction -> srcV1 restored; config.json untouched
     const restoredStat = await fs.lstat(destPath);
     assert.equal(restoredStat.isSymbolicLink(), true);
     assert.equal(await isSamePath(destPath, srcV1), true);
@@ -1341,8 +1166,7 @@ test('R3 hardening: symlink/junction overwrite with mode=copy failing mid-copy r
     assert.equal(restoredManifest.version, '1.0.0');
     assert.equal(await fs.readFile(path.join(destPath, 'aaa-v1.txt'), 'utf8'), 'v1-intact');
     await assert.rejects(() => fs.lstat(path.join(destPath, 'aaa-first.txt')));
-    const cfg = await readAntigravityConfig();
-    assert.equal(cfg.plugins['link-rollback'].enabled, true);
+    assert.equal(await fs.readFile(configPath, 'utf8'), initialConfig);
   } finally {
     if (lockerProc) {
       const proc = lockerProc;
@@ -1368,148 +1192,364 @@ test('R3 hardening: symlink/junction overwrite with mode=copy failing mid-copy r
   }
 });
 
-test('R3 hardening: symlink rollback does not re-enable manifestless directory when partial destPath cleanup is locked', async () => {
-  const sandbox = await fs.mkdtemp(path.join(os.tmpdir(), 'agy-link-locked-cleanup-'));
+test('R4: disabled plugin falls back to in-place sync when directory rename is blocked by watcher/EPERM', async () => {
+  const sandbox = await fs.mkdtemp(path.join(os.tmpdir(), 'agy-r4-inplace-ok-'));
   const prevPluginsDir = process.env.ANTIGRAVITY_PLUGINS_DIR;
   const prevConfigPath = process.env.ANTIGRAVITY_CONFIG_PATH;
-  let lockerProc = null;
-  let lockedDirOnPosix = false;
+  const watchers = [];
 
   try {
     const pluginsDir = path.join(sandbox, 'plugins');
-    const dataDir = path.join(sandbox, 'data');
     const configPath = path.join(sandbox, 'config.json');
     const srcV1 = path.join(sandbox, 'src-v1');
     const srcV2 = path.join(sandbox, 'src-v2');
+    process.env.ANTIGRAVITY_PLUGINS_DIR = pluginsDir;
+    process.env.ANTIGRAVITY_CONFIG_PATH = configPath;
 
+    // v1 layout: includes subdir, obsolete file, obsolete watched dir, and file<->dir type flips
+    await fs.mkdir(path.join(srcV1, 'sidecars', 'inspector'), { recursive: true });
+    await fs.mkdir(path.join(srcV1, 'obsolete-dir'), { recursive: true });
+    await fs.mkdir(path.join(srcV1, 'flip-dir-to-file'), { recursive: true });
+    await fs.writeFile(
+      path.join(srcV1, 'plugin.json'),
+      JSON.stringify({ name: 'disabled-watch-demo', version: '1.0.0' }),
+    );
+    await fs.writeFile(path.join(srcV1, 'keep.txt'), 'v1-keep', 'utf8');
+    await fs.writeFile(path.join(srcV1, 'obsolete-root.txt'), 'remove-me', 'utf8');
+    await fs.writeFile(path.join(srcV1, 'sidecars', 'inspector', 'main.mjs'), 'console.log("v1");', 'utf8');
+    await fs.writeFile(path.join(srcV1, 'obsolete-dir', 'old.txt'), 'old-nested', 'utf8');
+    await fs.writeFile(path.join(srcV1, 'flip-dir-to-file', 'inside.txt'), 'was-dir', 'utf8');
+    await fs.writeFile(path.join(srcV1, 'flip-file-to-dir'), 'was-file', 'utf8');
+
+    // v2 layout
+    await fs.mkdir(path.join(srcV2, 'sidecars', 'inspector'), { recursive: true });
+    await fs.mkdir(path.join(srcV2, 'new-dir'), { recursive: true });
+    await fs.mkdir(path.join(srcV2, 'flip-file-to-dir'), { recursive: true });
+    await fs.writeFile(
+      path.join(srcV2, 'plugin.json'),
+      JSON.stringify({ name: 'disabled-watch-demo', version: '2.0.0' }),
+    );
+    await fs.writeFile(path.join(srcV2, 'keep.txt'), 'v2-keep', 'utf8');
+    await fs.writeFile(path.join(srcV2, 'sidecars', 'inspector', 'main.mjs'), 'console.log("v2");', 'utf8');
+    await fs.writeFile(path.join(srcV2, 'new-dir', 'added.txt'), 'brand-new', 'utf8');
+    await fs.writeFile(path.join(srcV2, 'flip-dir-to-file'), 'now-file', 'utf8');
+    await fs.writeFile(path.join(srcV2, 'flip-file-to-dir', 'child.txt'), 'now-dir-child', 'utf8');
+
+    const initialConfig = JSON.stringify(
+      { plugins: { 'disabled-watch-demo': { enabled: false } } },
+      null,
+      2,
+    );
+    await fs.writeFile(configPath, initialConfig, 'utf8');
+
+    await installPlugin({ source: srcV1, scope: 'global' });
+    const destPath = path.join(pluginsDir, 'disabled-watch-demo');
+
+    // Simulate language_server.exe watching subdirectories on Windows, and fall back to simulated EPERM elsewhere
+    let moveHook = null;
+    if (process.platform === 'win32') {
+      watchers.push(fsWatch(path.join(destPath, 'sidecars', 'inspector'), () => {}));
+      watchers.push(fsWatch(path.join(destPath, 'obsolete-dir'), () => {}));
+    } else {
+      moveHook = async () => {
+        const e = new Error('EPERM: simulated watcher lock on rename');
+        e.code = 'EPERM';
+        throw e;
+      };
+    }
+
+    const res = await installPlugin({
+      source: srcV2,
+      scope: 'global',
+      overwrite: true,
+      removeRetries: 2,
+      removeRetryDelayMs: 20,
+      moveExistingToBackup: moveHook,
+    });
+
+    assert.equal(res.ok, true);
+    assert.equal(res.overwrote, true);
+    assert.equal(res.replacementMode, 'in-place');
+    assert.equal(res.enabled, false);
+
+    // Verify updated, added, flipped, and pruned files
+    const manifest = JSON.parse(await fs.readFile(path.join(destPath, 'plugin.json'), 'utf8'));
+    assert.equal(manifest.version, '2.0.0');
+    assert.equal(await fs.readFile(path.join(destPath, 'keep.txt'), 'utf8'), 'v2-keep');
+    assert.equal(
+      await fs.readFile(path.join(destPath, 'sidecars', 'inspector', 'main.mjs'), 'utf8'),
+      'console.log("v2");',
+    );
+    assert.equal(await fs.readFile(path.join(destPath, 'new-dir', 'added.txt'), 'utf8'), 'brand-new');
+    assert.equal(await fs.readFile(path.join(destPath, 'flip-dir-to-file'), 'utf8'), 'now-file');
+    assert.equal(
+      await fs.readFile(path.join(destPath, 'flip-file-to-dir', 'child.txt'), 'utf8'),
+      'now-dir-child',
+    );
+    await assert.rejects(() => fs.lstat(path.join(destPath, 'obsolete-root.txt')), { code: 'ENOENT' });
+    await assert.rejects(() => fs.lstat(path.join(destPath, 'obsolete-dir', 'old.txt')), { code: 'ENOENT' });
+
+    // config.json untouched and no sibling .backup directories left behind in pluginsDir
+    assert.equal(await fs.readFile(configPath, 'utf8'), initialConfig);
+    const rootEntries = await fs.readdir(pluginsDir);
+    assert.deepEqual(rootEntries, ['disabled-watch-demo']);
+  } finally {
+    for (const w of watchers) {
+      try {
+        w.close();
+      } catch {
+        // Ignore
+      }
+    }
+    if (prevPluginsDir === undefined) delete process.env.ANTIGRAVITY_PLUGINS_DIR;
+    else process.env.ANTIGRAVITY_PLUGINS_DIR = prevPluginsDir;
+    if (prevConfigPath === undefined) delete process.env.ANTIGRAVITY_CONFIG_PATH;
+    else process.env.ANTIGRAVITY_CONFIG_PATH = prevConfigPath;
+    await fs.rm(sandbox, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+  }
+});
+
+test('R4: disabled plugin in-place sync rolls back on genuinely locked file and reports locked=true + alreadyDisabled=true', async () => {
+  const sandbox = await fs.mkdtemp(path.join(os.tmpdir(), 'agy-r4-inplace-rollback-'));
+  const prevPluginsDir = process.env.ANTIGRAVITY_PLUGINS_DIR;
+  const prevConfigPath = process.env.ANTIGRAVITY_CONFIG_PATH;
+  let lockerProc = null;
+
+  const stopLocker = async () => {
+    if (!lockerProc) return;
+    const proc = lockerProc;
+    lockerProc = null;
+    await new Promise((resolve) => {
+      const killTimer = setTimeout(() => {
+        proc.kill();
+        resolve();
+      }, 2000);
+      proc.once('close', () => {
+        clearTimeout(killTimer);
+        resolve();
+      });
+      proc.stdin.write('\n');
+      proc.stdin.end();
+    });
+  };
+
+  try {
+    const pluginsDir = path.join(sandbox, 'plugins');
+    const configPath = path.join(sandbox, 'config.json');
+    const srcV1 = path.join(sandbox, 'src-v1');
+    const srcV2 = path.join(sandbox, 'src-v2');
     process.env.ANTIGRAVITY_PLUGINS_DIR = pluginsDir;
     process.env.ANTIGRAVITY_CONFIG_PATH = configPath;
 
     await fs.mkdir(srcV1, { recursive: true });
+    await fs.writeFile(path.join(srcV1, 'aaa-first.txt'), 'v1-first', 'utf8');
     await fs.writeFile(
       path.join(srcV1, 'plugin.json'),
-      JSON.stringify({ name: 'link-locked-cleanup', version: '1.0.0' }),
+      JSON.stringify({ name: 'disabled-locked-file', version: '1.0.0' }),
     );
+    await fs.writeFile(path.join(srcV1, 'zzz-locked.txt'), 'v1-locked', 'utf8');
 
     await fs.mkdir(srcV2, { recursive: true });
-    await fs.writeFile(path.join(srcV2, 'aaa-locked.txt'), 'lock-during-cleanup', 'utf8');
+    await fs.writeFile(path.join(srcV2, 'aaa-first.txt'), 'v2-first', 'utf8');
+    await fs.writeFile(path.join(srcV2, 'added-v2.txt'), 'should-be-rolled-back', 'utf8');
     await fs.writeFile(
       path.join(srcV2, 'plugin.json'),
-      JSON.stringify({ name: 'link-locked-cleanup', version: '2.0.0' }),
+      JSON.stringify({ name: 'disabled-locked-file', version: '2.0.0' }),
     );
-    await fs.writeFile(configPath, '{"plugins":{}}', 'utf8');
+    await fs.writeFile(path.join(srcV2, 'zzz-locked.txt'), 'v2-locked', 'utf8');
 
-    const registry = new InstallRegistry(dataDir);
-    await installPlugin({
-      source: srcV1,
-      sourceType: 'local',
-      mode: 'link',
-      scope: 'global',
-      installRegistry: registry,
-    });
-    await setPluginEnabled('link-locked-cleanup', true);
+    const initialConfig = JSON.stringify(
+      { plugins: { 'disabled-locked-file': { enabled: false } } },
+      null,
+      2,
+    );
+    await fs.writeFile(configPath, initialConfig, 'utf8');
 
-    const destPath = path.join(pluginsDir, 'link-locked-cleanup');
-    const destLockedFile = path.join(destPath, 'aaa-locked.txt');
+    await installPlugin({ source: srcV1, scope: 'global' });
+    const destPath = path.join(pluginsDir, 'disabled-locked-file');
+    const lockedFile = path.join(destPath, 'zzz-locked.txt');
+
+    if (process.platform === 'win32') {
+      // Lock with FileShare.Read so backup copy succeeds, aaa-first.txt updates,
+      // and then overwriting zzz-locked.txt fails mid-sync to exercise full rollback.
+      lockerProc = spawn(
+        'powershell.exe',
+        [
+          '-NoProfile',
+          '-Command',
+          `$fs = [System.IO.File]::Open($env:LOCK_TARGET, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::Read); [Console]::Out.WriteLine('LOCKED'); [Console]::In.ReadLine() | Out-Null; $fs.Dispose()`,
+        ],
+        {
+          stdio: ['pipe', 'pipe', 'pipe'],
+          env: { ...process.env, LOCK_TARGET: lockedFile },
+        },
+      );
+
+      await new Promise((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error('Timed out waiting for Windows file lock')), 8000);
+        let out = '';
+        lockerProc.stdout.setEncoding('utf8');
+        lockerProc.stdout.on('data', (chunk) => {
+          out += chunk;
+          if (out.includes('LOCKED')) {
+            clearTimeout(timer);
+            resolve();
+          }
+        });
+        lockerProc.once('exit', (code) => {
+          clearTimeout(timer);
+          reject(new Error(`Locker exited early with code ${code}`));
+        });
+      });
+
+      await assert.rejects(
+        () =>
+          installPlugin({
+            source: srcV2,
+            scope: 'global',
+            overwrite: true,
+            removeRetries: 1,
+            removeRetryDelayMs: 20,
+          }),
+        (err) => {
+          assert.equal(err.locked, true);
+          assert.equal(err.alreadyDisabled, true);
+          assert.match(err.message, /disabled plugin/i);
+          assert.match(err.message, /files are locked/i);
+          assert.match(err.message, /at "zzz-locked\.txt"/);
+          assert.doesNotMatch(err.message, /Disable "disabled-locked-file"/);
+          return true;
+        },
+      );
+
+      // Verify full rollback of modified and newly added files while locked file stays v1
+      assert.equal(await fs.readFile(path.join(destPath, 'aaa-first.txt'), 'utf8'), 'v1-first');
+      const rolledBackManifest = JSON.parse(await fs.readFile(path.join(destPath, 'plugin.json'), 'utf8'));
+      assert.equal(rolledBackManifest.version, '1.0.0');
+      await assert.rejects(() => fs.lstat(path.join(destPath, 'added-v2.txt')), { code: 'ENOENT' });
+      assert.equal(await fs.readFile(configPath, 'utf8'), initialConfig);
+      await stopLocker();
+      assert.equal(await fs.readFile(lockedFile, 'utf8'), 'v1-locked');
+    } else {
+      // Cross-platform fallback: verify post-sync failure rolls back and non-writable file reports alreadyDisabled
+      await assert.rejects(
+        () =>
+          installPlugin({
+            source: srcV2,
+            scope: 'global',
+            overwrite: true,
+            removeRetries: 1,
+            removeRetryDelayMs: 10,
+            moveExistingToBackup: async () => {
+              const e = new Error('EPERM: simulated rename lock');
+              e.code = 'EPERM';
+              throw e;
+            },
+            installRegistry: {
+              record: async () => {
+                const e = new Error('EBUSY: simulated post-sync lock');
+                e.code = 'EBUSY';
+                throw e;
+              },
+            },
+          }),
+        (err) => {
+          assert.equal(err.locked, true);
+          assert.equal(err.alreadyDisabled, true);
+          return true;
+        },
+      );
+      assert.equal(await fs.readFile(path.join(destPath, 'aaa-first.txt'), 'utf8'), 'v1-first');
+      await assert.rejects(() => fs.lstat(path.join(destPath, 'added-v2.txt')), { code: 'ENOENT' });
+    }
+  } finally {
+    await stopLocker();
+    if (prevPluginsDir === undefined) delete process.env.ANTIGRAVITY_PLUGINS_DIR;
+    else process.env.ANTIGRAVITY_PLUGINS_DIR = prevPluginsDir;
+    if (prevConfigPath === undefined) delete process.env.ANTIGRAVITY_CONFIG_PATH;
+    else process.env.ANTIGRAVITY_CONFIG_PATH = prevConfigPath;
+    await fs.rm(sandbox, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+  }
+});
+
+test('R4: enabled plugin under directory lock still refuses with locked=true, alreadyDisabled=false, and customizationUri', async () => {
+  const sandbox = await fs.mkdtemp(path.join(os.tmpdir(), 'agy-r4-enabled-lock-'));
+  const prevPluginsDir = process.env.ANTIGRAVITY_PLUGINS_DIR;
+  const prevConfigPath = process.env.ANTIGRAVITY_CONFIG_PATH;
+  let watcher = null;
+
+  try {
+    const pluginsDir = path.join(sandbox, 'plugins');
+    const configPath = path.join(sandbox, 'config.json');
+    const srcV1 = path.join(sandbox, 'src-v1');
+    const srcV2 = path.join(sandbox, 'src-v2');
+    process.env.ANTIGRAVITY_PLUGINS_DIR = pluginsDir;
+    process.env.ANTIGRAVITY_CONFIG_PATH = configPath;
+
+    await fs.mkdir(path.join(srcV1, 'sidecars', 'inspector'), { recursive: true });
+    await fs.writeFile(
+      path.join(srcV1, 'plugin.json'),
+      JSON.stringify({ name: 'enabled-watch-demo', version: '1.0.0' }),
+    );
+    await fs.writeFile(path.join(srcV1, 'sidecars', 'inspector', 'main.mjs'), 'v1', 'utf8');
+
+    await fs.mkdir(path.join(srcV2, 'sidecars', 'inspector'), { recursive: true });
+    await fs.writeFile(
+      path.join(srcV2, 'plugin.json'),
+      JSON.stringify({ name: 'enabled-watch-demo', version: '2.0.0' }),
+    );
+    await fs.writeFile(path.join(srcV2, 'sidecars', 'inspector', 'main.mjs'), 'v2', 'utf8');
+
+    const initialConfig = JSON.stringify(
+      { plugins: { 'enabled-watch-demo': { enabled: true } } },
+      null,
+      2,
+    );
+    await fs.writeFile(configPath, initialConfig, 'utf8');
+
+    await installPlugin({ source: srcV1, scope: 'global' });
+    const destPath = path.join(pluginsDir, 'enabled-watch-demo');
+
+    let moveHook = null;
+    if (process.platform === 'win32') {
+      watcher = fsWatch(path.join(destPath, 'sidecars', 'inspector'), () => {});
+    } else {
+      moveHook = async () => {
+        const e = new Error('EPERM: simulated watcher lock');
+        e.code = 'EPERM';
+        throw e;
+      };
+    }
 
     await assert.rejects(
       () =>
         installPlugin({
           source: srcV2,
-          sourceType: 'local',
-          mode: 'copy',
           scope: 'global',
           overwrite: true,
-          disableSettleMs: 0,
-          installRegistry: {
-            record: async () => {
-              if (process.platform === 'win32') {
-                lockerProc = spawn(
-                  'powershell.exe',
-                  [
-                    '-NoProfile',
-                    '-Command',
-                    `$fs = [System.IO.File]::Open($env:LOCK_TARGET, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None); [Console]::Out.WriteLine('LOCKED'); [Console]::In.ReadLine() | Out-Null; $fs.Dispose()`,
-                  ],
-                  {
-                    stdio: ['pipe', 'pipe', 'pipe'],
-                    env: { ...process.env, LOCK_TARGET: destLockedFile },
-                  },
-                );
-
-                await new Promise((resolve, reject) => {
-                  const timer = setTimeout(() => reject(new Error('Timed out waiting for Windows destination lock')), 8000);
-                  let out = '';
-                  lockerProc.stdout.setEncoding('utf8');
-                  lockerProc.stdout.on('data', (chunk) => {
-                    out += chunk;
-                    if (out.includes('LOCKED')) {
-                      clearTimeout(timer);
-                      resolve();
-                    }
-                  });
-                  lockerProc.once('exit', (code) => {
-                    clearTimeout(timer);
-                    reject(new Error(`Locker exited early with code ${code}`));
-                  });
-                });
-              } else {
-                await fs.unlink(path.join(destPath, 'plugin.json'));
-                await fs.chmod(destPath, 0o555);
-                lockedDirOnPosix = true;
-              }
-              throw new Error('Simulated post-copy registry failure');
-            },
-          },
+          removeRetries: 1,
+          removeRetryDelayMs: 20,
+          moveExistingToBackup: moveHook,
         }),
-      /Simulated post-copy registry failure/,
+      (err) => {
+        assert.equal(err.locked, true);
+        assert.equal(err.alreadyDisabled, false);
+        assert.equal(err.customizationUri, 'customization://enabled-watch-demo');
+        assert.match(err.message, /Disable "enabled-watch-demo"/);
+        return true;
+      },
     );
 
-    // Partial destPath remains manifestless (not a restored symlink) and must NOT be re-enabled
-    const remainingStat = await fs.lstat(destPath);
-    assert.equal(remainingStat.isSymbolicLink(), false);
-    assert.equal(remainingStat.isDirectory(), true);
-    await assert.rejects(() => fs.lstat(path.join(destPath, 'plugin.json')));
-
-    const cfg = await readAntigravityConfig();
-    assert.equal(cfg.plugins['link-locked-cleanup'].enabled, false);
-
-    if (lockerProc) {
-      const proc = lockerProc;
-      lockerProc = null;
-      await new Promise((resolve) => {
-        const killTimer = setTimeout(() => {
-          proc.kill();
-          resolve();
-        }, 2000);
-        proc.once('close', () => {
-          clearTimeout(killTimer);
-          resolve();
-        });
-        proc.stdin.write('\n');
-        proc.stdin.end();
-      });
-    }
-    assert.equal(await fs.readFile(destLockedFile, 'utf8'), 'lock-during-cleanup');
+    const manifest = JSON.parse(await fs.readFile(path.join(destPath, 'plugin.json'), 'utf8'));
+    assert.equal(manifest.version, '1.0.0');
+    assert.equal(await fs.readFile(configPath, 'utf8'), initialConfig);
   } finally {
-    if (lockerProc) {
-      const proc = lockerProc;
-      lockerProc = null;
-      await new Promise((resolve) => {
-        const killTimer = setTimeout(() => {
-          proc.kill();
-          resolve();
-        }, 2000);
-        proc.once('close', () => {
-          clearTimeout(killTimer);
-          resolve();
-        });
-        proc.stdin.write('\n');
-        proc.stdin.end();
-      });
-    }
-    if (lockedDirOnPosix) {
-      await fs.chmod(path.join(sandbox, 'plugins', 'link-locked-cleanup'), 0o755).catch(() => {});
+    if (watcher) {
+      try {
+        watcher.close();
+      } catch {
+        // Ignore
+      }
     }
     if (prevPluginsDir === undefined) delete process.env.ANTIGRAVITY_PLUGINS_DIR;
     else process.env.ANTIGRAVITY_PLUGINS_DIR = prevPluginsDir;
@@ -1518,3 +1558,194 @@ test('R3 hardening: symlink rollback does not re-enable manifestless directory w
     await fs.rm(sandbox, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
+
+test(
+  'R4: MCP stdio app_reinstall_plugin succeeds in-place on watched disabled plugin and forwards alreadyDisabled on hard file lock',
+  { skip: process.platform !== 'win32' },
+  async () => {
+    const sandbox = await fs.mkdtemp(path.join(os.tmpdir(), 'agy-r4-mcp-lock-'));
+    const pluginsDir = path.join(sandbox, 'plugins');
+    const builtinDir = path.join(sandbox, 'builtin');
+    const dataDir = path.join(sandbox, 'data');
+    const configPath = path.join(sandbox, 'config.json');
+    const srcDir = path.join(sandbox, 'src-plugin');
+    let child = null;
+    let watcher = null;
+    let lockerProc = null;
+
+    const stopLocker = async () => {
+      if (!lockerProc) return;
+      const proc = lockerProc;
+      lockerProc = null;
+      await new Promise((resolve) => {
+        const killTimer = setTimeout(() => {
+          proc.kill();
+          resolve();
+        }, 2000);
+        proc.once('close', () => {
+          clearTimeout(killTimer);
+          resolve();
+        });
+        proc.stdin.write('\n');
+        proc.stdin.end();
+      });
+    };
+
+    try {
+      await fs.mkdir(path.join(srcDir, 'sidecars', 'inspector'), { recursive: true });
+      await fs.writeFile(
+        path.join(srcDir, 'plugin.json'),
+        JSON.stringify({ name: 'mcp-watch-demo', displayName: 'MCP Watch Demo', version: '1.0.0' }),
+      );
+      await fs.writeFile(path.join(srcDir, 'sidecars', 'inspector', 'main.mjs'), 'v1', 'utf8');
+      await fs.writeFile(
+        configPath,
+        JSON.stringify({ plugins: { 'mcp-watch-demo': { enabled: false } } }, null, 2),
+        'utf8',
+      );
+
+      child = spawn(process.execPath, [path.join(REPO_ROOT, 'server', 'index.mjs'), '--data-dir', dataDir], {
+        stdio: ['pipe', 'pipe', 'pipe'],
+        env: {
+          ...process.env,
+          ANTIGRAVITY_PLUGINS_DIR: pluginsDir,
+          ANTIGRAVITY_BUILTIN_PLUGINS_DIR: builtinDir,
+          ANTIGRAVITY_CONFIG_PATH: configPath,
+        },
+      });
+
+      let stdoutBuf = '';
+      const pending = new Map();
+      child.stdout.setEncoding('utf8');
+      child.stdout.on('data', (chunk) => {
+        stdoutBuf += chunk;
+        let idx;
+        while ((idx = stdoutBuf.indexOf('\n')) !== -1) {
+          const line = stdoutBuf.slice(0, idx).trim();
+          stdoutBuf = stdoutBuf.slice(idx + 1);
+          if (!line) continue;
+          const msg = JSON.parse(line);
+          const resolver = pending.get(msg.id);
+          if (resolver) {
+            pending.delete(msg.id);
+            resolver(msg);
+          }
+        }
+      });
+
+      const rpc = (id, method, params = {}) =>
+        new Promise((resolve, reject) => {
+          const timer = setTimeout(() => reject(new Error(`Timeout waiting for ${method}`)), 12000);
+          pending.set(id, (msg) => {
+            clearTimeout(timer);
+            resolve(msg);
+          });
+          child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id, method, params })}\n`);
+        });
+
+      await rpc(1, 'initialize', { protocolVersion: '2025-11-25', capabilities: {}, clientInfo: { name: 'test', version: '1.0' } });
+
+      const inst = await rpc(2, 'tools/call', {
+        name: 'app_install_plugin',
+        arguments: { source: srcDir, scope: 'global' },
+      });
+      assert.equal(inst.result.structuredContent.ok, true);
+
+      const destPath = path.join(pluginsDir, 'mcp-watch-demo');
+      watcher = fsWatch(path.join(destPath, 'sidecars', 'inspector'), () => {});
+
+      // 1. Disabled + watched subdir -> app_reinstall_plugin succeeds in-place
+      await fs.writeFile(
+        path.join(srcDir, 'plugin.json'),
+        JSON.stringify({ name: 'mcp-watch-demo', displayName: 'MCP Watch Demo', version: '2.0.0' }),
+      );
+      await fs.writeFile(path.join(srcDir, 'sidecars', 'inspector', 'main.mjs'), 'v2', 'utf8');
+
+      const updOk = await rpc(3, 'tools/call', {
+        name: 'app_reinstall_plugin',
+        arguments: { dir: 'mcp-watch-demo', scope: 'global' },
+      });
+      assert.equal(updOk.result.structuredContent.ok, true);
+      assert.equal(updOk.result.structuredContent.install.replacementMode, 'in-place');
+      assert.equal(updOk.result.structuredContent.install.plugin.version, '2.0.0');
+
+      // 2. Disabled + genuinely locked file -> forwards locked=true, alreadyDisabled=true
+      const lockedFile = path.join(destPath, 'sidecars', 'inspector', 'main.mjs');
+      lockerProc = spawn(
+        'powershell.exe',
+        [
+          '-NoProfile',
+          '-Command',
+          `$fs = [System.IO.File]::Open($env:LOCK_TARGET, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::Read); [Console]::Out.WriteLine('LOCKED'); [Console]::In.ReadLine() | Out-Null; $fs.Dispose()`,
+        ],
+        {
+          stdio: ['pipe', 'pipe', 'pipe'],
+          env: { ...process.env, LOCK_TARGET: lockedFile },
+        },
+      );
+      await new Promise((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error('Timed out waiting for lock')), 8000);
+        let out = '';
+        lockerProc.stdout.setEncoding('utf8');
+        lockerProc.stdout.on('data', (chunk) => {
+          out += chunk;
+          if (out.includes('LOCKED')) {
+            clearTimeout(timer);
+            resolve();
+          }
+        });
+        lockerProc.once('exit', (code) => {
+          clearTimeout(timer);
+          reject(new Error(`Locker exited early with code ${code}`));
+        });
+      });
+
+      const updFail = await rpc(4, 'tools/call', {
+        name: 'app_reinstall_plugin',
+        arguments: { dir: 'mcp-watch-demo', scope: 'global' },
+      });
+      assert.equal(updFail.result.structuredContent.ok, false);
+      assert.equal(updFail.result.structuredContent.locked, true);
+      assert.equal(updFail.result.structuredContent.alreadyDisabled, true);
+
+      // 3. Enabled + watched subdir -> forwards locked=true, alreadyDisabled=false
+      await stopLocker();
+      await fs.writeFile(
+        configPath,
+        JSON.stringify({ plugins: { 'mcp-watch-demo': { enabled: true } } }, null, 2),
+        'utf8',
+      );
+      const updEnabledLocked = await rpc(5, 'tools/call', {
+        name: 'app_install_plugin',
+        arguments: { source: srcDir, scope: 'global', overwrite: true },
+      });
+      assert.equal(updEnabledLocked.result.structuredContent.ok, false);
+      assert.equal(updEnabledLocked.result.structuredContent.locked, true);
+      assert.equal(updEnabledLocked.result.structuredContent.alreadyDisabled, false);
+      assert.equal(updEnabledLocked.result.structuredContent.customizationUri, 'customization://mcp-watch-demo');
+    } finally {
+      await stopLocker();
+      if (watcher) {
+        try {
+          watcher.close();
+        } catch {
+          // Ignore
+        }
+      }
+      if (child) {
+        const exitPromise = new Promise((resolve) => {
+          if (child.exitCode !== null || child.signalCode !== null) {
+            resolve();
+            return;
+          }
+          child.once('close', resolve);
+          setTimeout(resolve, 1000);
+        });
+        child.stdin.end();
+        child.kill();
+        await exitPromise;
+      }
+      await fs.rm(sandbox, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    }
+  },
+);

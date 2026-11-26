@@ -19,8 +19,15 @@ export interface Messages {
   emptySearchDesc: string;
   enabled: string;
   disabled: string;
-  enablePlugin: string;
-  disablePlugin: string;
+  manageNative: string;
+  hideManageNative: string;
+  nativeManageTitle: string;
+  nativeManageDesc: string;
+  nativeManageLinkLabel: string;
+  nativeManageSendChat: string;
+  nativeManageSentChat: string;
+  nativeManageCopyLink: string;
+  nativeManageCopied: string;
   builtin: string;
   linked: string;
   globalScope: string;
@@ -97,14 +104,11 @@ export interface Messages {
   installAnother: string;
   toastUninstalled: string;
   toastUpdated: string;
-  toastUpdatedRestored: string;
-  toastUpdatedKeptDisabled: string;
   toastInstalled: string;
-  toastEnabled: string;
-  toastDisabled: string;
-  errSelfDisable: string;
   errSelfUpdate: string;
   errSelfUninstall: string;
+  errFilesLocked: string;
+  errFilesLockedDisabled: string;
   loading: string;
 }
 
@@ -127,8 +131,16 @@ const zh: Messages = {
   emptySearchDesc: '尝试更换关键词或切换上方筛选分类。',
   enabled: '已启用',
   disabled: '已禁用',
-  enablePlugin: '启用插件',
-  disablePlugin: '禁用插件',
+  manageNative: '原生启停',
+  hideManageNative: '收起指引',
+  nativeManageTitle: '请在 Antigravity 原生 Customizations 页面切换启停',
+  nativeManageDesc:
+    'Antigravity 由 Language Server 统一托管插件热重载（MCP、Sidecar、Hooks、Rules）。请前往左侧栏 Customizations → Installed 页面找到该插件进行启用或禁用（立即生效、无需重启）。',
+  nativeManageLinkLabel: '原生插件链接',
+  nativeManageSendChat: '在对话中发送跳转链接',
+  nativeManageSentChat: '已将原生管理跳转链接发送到当前对话',
+  nativeManageCopyLink: '复制链接',
+  nativeManageCopied: '已复制原生插件链接',
   builtin: '内置',
   linked: '软链接',
   globalScope: '全局',
@@ -199,24 +211,22 @@ const zh: Messages = {
   overwriteLabel: '如存在同名插件，覆盖重新安装',
   securityNoticeTitle: '请确认插件来源可信',
   securityNoticeBody:
-    '插件中的 MCP Server 与 Hooks 会以当前用户权限运行。安装完成后 Antigravity 会自动热发现新插件；也可在插件列表中直接切换启用或禁用状态。',
+    '插件中的 MCP Server 与 Hooks 会以当前用户权限运行。安装完成后 Antigravity 会自动热发现新插件；如需启用或禁用，请前往 Antigravity 原生 Customizations → Installed 页面操作（实时生效）。',
   installSubmit: '安装插件',
   installing: '正在安装...',
   overwriteAndRetry: '勾选覆盖并重新安装',
   installSuccessTitle: '插件安装成功',
-  installSuccessHint: 'Antigravity 会自动发现新安装的插件（无需重启）。可在插件列表中直接切换启用/禁用，或前往原生 Customizations 页面管理。',
+  installSuccessHint: 'Antigravity 会自动发现新安装的插件（无需重启）。如需启用、禁用或配置凭据，请前往原生 Customizations → Installed 页面管理。',
   done: '完成',
   installAnother: '继续安装其他插件',
   toastUninstalled: '已卸载插件',
   toastUpdated: '已重新安装插件',
-  toastUpdatedRestored: '已更新并恢复启用',
-  toastUpdatedKeptDisabled: '已更新（保持禁用）',
   toastInstalled: '已成功安装插件',
-  toastEnabled: '已启用插件',
-  toastDisabled: '已禁用插件',
-  errSelfDisable: '无法在当前面板中禁用 Plugin Installer 自身，否则会中断其 MCP 服务与管理界面。',
   errSelfUpdate: '无法在当前面板中更新 Plugin Installer 自身，请使用 npm run install:local 或 Antigravity CLI 更新。',
   errSelfUninstall: '无法在当前面板中卸载 Plugin Installer 自身，否则会删除其正在运行的 MCP 服务与管理界面。',
+  errFilesLocked: '插件文件正在被运行中的进程占用，无法直接覆盖。请先在 Antigravity 原生 Customizations → Installed 页面禁用该插件（停止其 MCP Server / Sidecar），然后重试更新。',
+  errFilesLockedDisabled:
+    '该插件已处于禁用状态，但部分文件或目录仍被 Antigravity 或其他进程占用，无法完成替换。请重启 Antigravity 或关闭占用该插件目录的进程后重试。',
   loading: '正在加载已安装插件...',
 };
 
@@ -239,8 +249,16 @@ const en: Messages = {
   emptySearchDesc: 'Try a different search query or filter category.',
   enabled: 'Enabled',
   disabled: 'Disabled',
-  enablePlugin: 'Enable plugin',
-  disablePlugin: 'Disable plugin',
+  manageNative: 'Enable / Disable',
+  hideManageNative: 'Close guide',
+  nativeManageTitle: 'Toggle live in Antigravity Customizations',
+  nativeManageDesc:
+    'Antigravity manages live plugin reloads (MCP servers, sidecars, hooks, and rules) inside its Language Server. Open Customizations → Installed in the left sidebar to enable or disable this plugin live without restarting.',
+  nativeManageLinkLabel: 'Native link',
+  nativeManageSendChat: 'Send jump link to chat',
+  nativeManageSentChat: 'Sent native link request to chat',
+  nativeManageCopyLink: 'Copy link',
+  nativeManageCopied: 'Copied native plugin link',
   builtin: 'Built-in',
   linked: 'Linked',
   globalScope: 'Global',
@@ -311,24 +329,22 @@ const en: Messages = {
   overwriteLabel: 'Overwrite if a plugin with the same directory already exists',
   securityNoticeTitle: 'Verify plugin trust before installing',
   securityNoticeBody:
-    'Bundled MCP servers and hooks run with your user permissions. Newly installed plugins are discovered automatically without restarting, and can be enabled or disabled directly from their plugin card.',
+    'Bundled MCP servers and hooks run with your user permissions. Newly installed plugins are discovered automatically without restarting; manage live enable/disable state in Antigravity Customizations → Installed.',
   installSubmit: 'Install Plugin',
   installing: 'Installing...',
   overwriteAndRetry: 'Overwrite & Retry',
   installSuccessTitle: 'Plugin installed',
-  installSuccessHint: 'Antigravity discovers new plugins automatically. Toggle enable/disable state directly from the plugin list or in Customizations.',
+  installSuccessHint: 'Antigravity discovers new plugins automatically. Use Antigravity’s native Customizations → Installed page to toggle enable/disable live or configure credentials.',
   done: 'Done',
   installAnother: 'Install another',
   toastUninstalled: 'Uninstalled',
   toastUpdated: 'Updated',
-  toastUpdatedRestored: 'Updated and re-enabled',
-  toastUpdatedKeptDisabled: 'Updated (kept disabled)',
   toastInstalled: 'Installed',
-  toastEnabled: 'Enabled',
-  toastDisabled: 'Disabled',
-  errSelfDisable: 'Cannot disable Plugin Installer from its own panel, as doing so would terminate its active MCP server and UI.',
   errSelfUpdate: 'Cannot update Plugin Installer from inside its own running MCP server. Use "npm run install:local" or Antigravity CLI.',
   errSelfUninstall: 'Cannot uninstall Plugin Installer from its own panel, as doing so would delete its running MCP server and UI.',
+  errFilesLocked: 'Plugin files are currently locked by a running process. Disable this plugin in Antigravity Customizations → Installed first so its MCP server or sidecar stops, then retry updating.',
+  errFilesLockedDisabled:
+    'This plugin is already disabled, but some files or folders are still locked by Antigravity or another process. Restart Antigravity or close the process holding the plugin files, then retry.',
   loading: 'Loading installed plugins...',
 };
 
