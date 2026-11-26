@@ -1,6 +1,6 @@
 {
   "name": "antigravity-plugin-installer",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "private": true,
   "type": "module",
   "description": "Install and manage Antigravity plugins from GitHub repositories, npm packages, or local directories via an integrated MCP App UI.",

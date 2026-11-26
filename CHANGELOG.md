@@ -2,6 +2,16 @@
 
 All notable changes to **Plugin Installer for Antigravity** are documented in this file.
 
+## v1.1.1 (2026-11-26)
+
+### Changed
+- 对齐只读配置规范：停止直接修改 `~/.gemini/config/config.json`（移除 `app_set_plugin_enabled` 与更新时自动禁用写入逻辑），改为只读读取插件启用状态，并提供 Antigravity 原生 Customizations（`customization://<dir>`）操作引导与直达链接。
+- 更新单元测试与 4 层级端到端（E2E）测试套件（17 项单元测试 + 66 项 E2E 测试），覆盖只读配置引导、Windows 原地同步回滚及已禁用插件锁错误场景。
+
+### Fixed
+- 修复 Windows 环境下更新已禁用插件仍报资源锁定的问题：当 `language_server.exe` 目录监听器阻止 `fs.rename` 时，自动降级为安全的原地同步策略（`synchronizeDirInPlace`），在 `os.tmpdir()` 中保存备份并在失败时回滚，同时为辅助重命名操作增加 `renameWithRetry` 退避重试。
+- 改进前后端文件锁错误处理：透传 `alreadyDisabled` 标记，对已禁用插件触发的锁冲突单独展示 `errFilesLockedDisabled` 及诊断详情，避免错误提示用户禁用本已禁用的插件。
+
 ## v1.1.0 (2026-11-26)
 
 ### Added
